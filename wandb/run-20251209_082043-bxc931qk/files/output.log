@@ -1,0 +1,4 @@
+Starting S-MEME Fine-tuning for 20000 steps...
+  0% 0/20000 [00:00<?, ?it/s]/usr/local/lib/python3.12/dist-packages/torch/utils/data/dataloader.py:668: UserWarning: 'pin_memory' argument is set as true but no accelerator is found, then device pinned memory won't be used.
+  warnings.warn(warn_msg)
+S-MEME loss: 0.0121:   0% 99/20000 [01:29<5:19:28,  1.04it/s]

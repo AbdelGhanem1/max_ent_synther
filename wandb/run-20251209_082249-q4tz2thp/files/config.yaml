@@ -1,0 +1,84 @@
+_wandb:
+    value:
+        cli_version: 0.23.1
+        e:
+            ubu5jt9qlnaa3xnd7v1g8ckllynjsxih:
+                args:
+                    - --dataset
+                    - hopper-medium-replay-v2
+                    - --load_checkpoint
+                    - ./results/model-100000.pt
+                    - --results_folder
+                    - ./results_smeme
+                    - --gin_config_files
+                    - ./config/resmlp_denoiser.gin
+                    - --smeme_step_size
+                    - "0.1"
+                    - --train_num_steps
+                    - "20000"
+                codePath: synther/diffusion/train_smeme.py
+                codePathLocal: synther/diffusion/train_smeme.py
+                cpu_count: 1
+                cpu_count_logical: 2
+                cudaVersion: "12.4"
+                disk:
+                    /:
+                        total: "120942624768"
+                        used: "41503985664"
+                email: ghanem96abdelghani@gmail.com
+                executable: /usr/bin/python3
+                gpu: Tesla T4
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Turing
+                      cudaCores: 2560
+                      memoryTotal: "16106127360"
+                      name: Tesla T4
+                      uuid: GPU-76da2dcf-6bf9-3d3d-bed4-eab6af8341b9
+                host: ba33f0a2d774
+                memory:
+                    total: "13605851136"
+                os: Linux-6.6.105+-x86_64-with-glibc2.35
+                program: /content/drive/.shortcut-targets-by-id/1obZHzzja4X-DUgsyz_Y67Ge9WOP9Kl8V/synthER/synther/diffusion/train_smeme.py
+                python: CPython 3.12.12
+                root: /content/drive/.shortcut-targets-by-id/1obZHzzja4X-DUgsyz_Y67Ge9WOP9Kl8V/synthER
+                startedAt: "2025-12-09T08:22:49.450368Z"
+                writerId: ubu5jt9qlnaa3xnd7v1g8ckllynjsxih
+        m: []
+        python_version: 3.12.12
+        t:
+            "1":
+                - 1
+                - 49
+                - 71
+                - 105
+            "2":
+                - 1
+                - 49
+                - 71
+                - 105
+            "3":
+                - 16
+            "4": 3.12.12
+            "5": 0.23.1
+            "12": 0.23.1
+            "13": linux-x86_64
+dataset:
+    value: hopper-medium-replay-v2
+gin_config_files:
+    value:
+        - ./config/resmlp_denoiser.gin
+gin_params:
+    value: []
+load_checkpoint:
+    value: ./results/model-100000.pt
+results_folder:
+    value: ./results_smeme
+seed:
+    value: 0
+smeme_step_size:
+    value: 0.1
+train_num_steps:
+    value: 20000
+wandb_project:
+    value: smeme-finetuning

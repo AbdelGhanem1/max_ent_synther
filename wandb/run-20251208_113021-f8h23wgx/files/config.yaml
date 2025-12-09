@@ -1,0 +1,85 @@
+_wandb:
+    value:
+        cli_version: 0.23.0
+        e:
+            8n4cbsm1r3mhpcackabky8b8209cjy76:
+                args:
+                    - --dataset
+                    - hopper-medium-replay-v2
+                    - --gin_config_files
+                    - ./config/resmlp_denoiser.gin
+                codePath: synther/diffusion/train_diffuser.py
+                codePathLocal: synther/diffusion/train_diffuser.py
+                cpu_count: 1
+                cpu_count_logical: 2
+                cudaVersion: "12.4"
+                disk:
+                    /:
+                        total: "120942624768"
+                        used: "41085104128"
+                email: ghanem96abdelghani@gmail.com
+                executable: /usr/bin/python3
+                gpu: Tesla T4
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Turing
+                      cudaCores: 2560
+                      memoryTotal: "16106127360"
+                      name: Tesla T4
+                      uuid: GPU-59f5ec4f-d27c-82c5-8eb9-5b1d28ea0a19
+                host: 0ea1e5690888
+                memory:
+                    total: "13605851136"
+                os: Linux-6.6.105+-x86_64-with-glibc2.35
+                program: /content/drive/MyDrive/synthER/synther/diffusion/train_diffuser.py
+                python: CPython 3.12.12
+                root: /content/drive/MyDrive/synthER
+                startedAt: "2025-12-08T11:30:21.808440Z"
+                writerId: 8n4cbsm1r3mhpcackabky8b8209cjy76
+        m: []
+        python_version: 3.12.12
+        t:
+            "1":
+                - 1
+                - 49
+                - 71
+                - 105
+            "2":
+                - 1
+                - 49
+                - 71
+                - 105
+            "3":
+                - 13
+                - 16
+            "4": 3.12.12
+            "5": 0.23.0
+            "12": 0.23.0
+            "13": linux-x86_64
+dataset:
+    value: hopper-medium-replay-v2
+gin_config_files:
+    value:
+        - ./config/resmlp_denoiser.gin
+gin_params:
+    value: []
+load_checkpoint:
+    value: false
+results_folder:
+    value: ./results
+save_file_name:
+    value: 5m_samples.npz
+save_num_samples:
+    value: 5000000
+save_samples:
+    value: true
+seed:
+    value: 0
+use_gpu:
+    value: true
+wandb_entity:
+    value: ""
+wandb_group:
+    value: diffusion_training
+wandb_project:
+    value: offline-rl-diffusion

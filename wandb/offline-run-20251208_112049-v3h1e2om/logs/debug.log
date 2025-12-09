@@ -1,0 +1,21 @@
+2025-12-08 11:20:49,341 INFO    MainThread:6428 [wandb_setup.py:_flush():80] Current SDK version is 0.23.0
+2025-12-08 11:20:49,343 INFO    MainThread:6428 [wandb_setup.py:_flush():80] Configure stats pid to 6428
+2025-12-08 11:20:49,344 INFO    MainThread:6428 [wandb_setup.py:_flush():80] Loading settings from /root/.config/wandb/settings
+2025-12-08 11:20:49,345 INFO    MainThread:6428 [wandb_setup.py:_flush():80] Loading settings from /content/drive/MyDrive/synthER/wandb/settings
+2025-12-08 11:20:49,346 INFO    MainThread:6428 [wandb_setup.py:_flush():80] Loading settings from environment variables
+2025-12-08 11:20:49,346 INFO    MainThread:6428 [wandb_init.py:setup_run_log_directory():713] Logging user logs to /content/drive/MyDrive/synthER/wandb/offline-run-20251208_112049-v3h1e2om/logs/debug.log
+2025-12-08 11:20:49,347 INFO    MainThread:6428 [wandb_init.py:setup_run_log_directory():714] Logging internal logs to /content/drive/MyDrive/synthER/wandb/offline-run-20251208_112049-v3h1e2om/logs/debug-internal.log
+2025-12-08 11:20:49,347 INFO    MainThread:6428 [wandb_init.py:init():840] calling init triggers
+2025-12-08 11:20:49,348 INFO    MainThread:6428 [wandb_init.py:init():845] wandb.init called with sweep_config: {}
+config: {'dataset': 'hopper-medium-replay-v2', 'gin_config_files': ['./config/resmlp_denoiser.gin'], 'gin_params': [], 'wandb_project': 'offline-rl-diffusion', 'wandb_entity': '', 'wandb_group': 'diffusion_training', 'results_folder': './results', 'use_gpu': True, 'seed': 0, 'save_samples': True, 'save_num_samples': 5000000, 'save_file_name': '5m_samples.npz', 'load_checkpoint': False, '_wandb': {}}
+2025-12-08 11:20:49,348 INFO    MainThread:6428 [wandb_init.py:init():888] starting backend
+2025-12-08 11:20:50,429 INFO    MainThread:6428 [wandb_init.py:init():891] sending inform_init request
+2025-12-08 11:20:50,444 INFO    MainThread:6428 [wandb_init.py:init():899] backend started and connected
+2025-12-08 11:20:50,447 INFO    MainThread:6428 [wandb_init.py:init():969] updated telemetry
+2025-12-08 11:20:50,459 INFO    MainThread:6428 [wandb_init.py:init():993] communicating run to backend with 90.0 second timeout
+2025-12-08 11:20:50,615 INFO    MainThread:6428 [wandb_init.py:init():1040] starting run threads in backend
+2025-12-08 11:20:51,586 INFO    MainThread:6428 [wandb_run.py:_console_start():2504] atexit reg
+2025-12-08 11:20:51,590 INFO    MainThread:6428 [wandb_run.py:_redirect():2352] redirect: wrap_raw
+2025-12-08 11:20:51,591 INFO    MainThread:6428 [wandb_run.py:_redirect():2421] Wrapping output streams.
+2025-12-08 11:20:51,592 INFO    MainThread:6428 [wandb_run.py:_redirect():2444] Redirects installed.
+2025-12-08 11:20:51,621 INFO    MainThread:6428 [wandb_init.py:init():1080] run started, returning control to user process

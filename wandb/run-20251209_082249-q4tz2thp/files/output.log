@@ -1,0 +1,3 @@
+Starting S-MEME Fine-tuning for 20000 steps...
+S-MEME loss: 0.0006: 100% 20000/20000 [08:43<00:00, 38.22it/s]  
+S-MEME Fine-tuning complete.

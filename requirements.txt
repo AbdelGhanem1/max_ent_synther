@@ -1,0 +1,10 @@
+accelerate
+einops
+ema-pytorch
+torchdiffeq
+pyrallis
+gin-config
+wandb
+h5py
+# We need gymnasium with mujoco support to create the dummy env for dimensions
+gymnasium[mujoco]

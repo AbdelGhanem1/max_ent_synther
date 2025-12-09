@@ -1,0 +1,23 @@
+2025-12-08 16:50:11,821 INFO    MainThread:797 [wandb_setup.py:_flush():80] Current SDK version is 0.23.0
+2025-12-08 16:50:11,822 INFO    MainThread:797 [wandb_setup.py:_flush():80] Configure stats pid to 797
+2025-12-08 16:50:11,822 INFO    MainThread:797 [wandb_setup.py:_flush():80] Loading settings from /root/.config/wandb/settings
+2025-12-08 16:50:11,822 INFO    MainThread:797 [wandb_setup.py:_flush():80] Loading settings from /content/drive/MyDrive/synthER/wandb/settings
+2025-12-08 16:50:11,823 INFO    MainThread:797 [wandb_setup.py:_flush():80] Loading settings from environment variables
+2025-12-08 16:50:11,824 INFO    MainThread:797 [wandb_init.py:setup_run_log_directory():713] Logging user logs to /content/drive/MyDrive/synthER/wandb/run-20251208_165011-eou2n4od/logs/debug.log
+2025-12-08 16:50:11,824 INFO    MainThread:797 [wandb_init.py:setup_run_log_directory():714] Logging internal logs to /content/drive/MyDrive/synthER/wandb/run-20251208_165011-eou2n4od/logs/debug-internal.log
+2025-12-08 16:50:11,825 INFO    MainThread:797 [wandb_init.py:init():840] calling init triggers
+2025-12-08 16:50:11,825 INFO    MainThread:797 [wandb_init.py:init():845] wandb.init called with sweep_config: {}
+config: {'dataset': 'hopper-medium-replay-v2', 'load_checkpoint': './results/model-100000.pt', 'results_folder': './results_smeme', 'smeme_step_size': 0.1, 'train_num_steps': 10000, 'gin_config_files': ['./config/resmlp_denoiser.gin'], 'gin_params': [], 'wandb_project': 'smeme-finetuning', 'seed': 0, '_wandb': {}}
+2025-12-08 16:50:11,825 INFO    MainThread:797 [wandb_init.py:init():888] starting backend
+2025-12-08 16:50:12,556 INFO    MainThread:797 [wandb_init.py:init():891] sending inform_init request
+2025-12-08 16:50:12,566 INFO    MainThread:797 [wandb_init.py:init():899] backend started and connected
+2025-12-08 16:50:12,568 INFO    MainThread:797 [wandb_init.py:init():969] updated telemetry
+2025-12-08 16:50:12,572 INFO    MainThread:797 [wandb_init.py:init():993] communicating run to backend with 90.0 second timeout
+2025-12-08 16:50:13,156 INFO    MainThread:797 [wandb_init.py:init():1040] starting run threads in backend
+2025-12-08 16:50:13,693 INFO    MainThread:797 [wandb_run.py:_console_start():2504] atexit reg
+2025-12-08 16:50:13,696 INFO    MainThread:797 [wandb_run.py:_redirect():2352] redirect: wrap_raw
+2025-12-08 16:50:13,696 INFO    MainThread:797 [wandb_run.py:_redirect():2421] Wrapping output streams.
+2025-12-08 16:50:13,697 INFO    MainThread:797 [wandb_run.py:_redirect():2444] Redirects installed.
+2025-12-08 16:50:13,706 INFO    MainThread:797 [wandb_init.py:init():1080] run started, returning control to user process
+2025-12-08 16:54:30,990 INFO    wandb-AsyncioManager-main:797 [service_client.py:_forward_responses():80] Reached EOF.
+2025-12-08 16:54:30,994 INFO    wandb-AsyncioManager-main:797 [mailbox.py:close():137] Closing mailbox, abandoning 1 handles.

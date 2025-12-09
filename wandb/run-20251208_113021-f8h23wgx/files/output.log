@@ -1,0 +1,28 @@
+loss: 0.3800: 100% 100000/100000 [38:06<00:00, 43.74it/s] 
+training complete
+Sampling using: 128 steps, 100000 batch size.
+Generating split 1 of 50
+sampling time step: 100% 128/128 [06:58<00:00,  3.27s/it]
+Generating split 2 of 50
+sampling time step: 100% 128/128 [07:01<00:00,  3.29s/it]
+Generating split 3 of 50
+sampling time step: 100% 128/128 [07:02<00:00,  3.30s/it]
+Generating split 4 of 50
+sampling time step:  82% 105/128 [05:48<01:16,  3.32s/it]
+Traceback (most recent call last):
+  File "/content/drive/MyDrive/synthER/synther/diffusion/train_diffuser.py", line 189, in <module>
+    observations, actions, rewards, next_observations, terminals = generator.sample(
+                                                                   ^^^^^^^^^^^^^^^^^
+  File "/content/drive/MyDrive/synthER/synther/diffusion/train_diffuser.py", line 67, in sample
+    sampled_outputs = self.diffusion.sample(
+                      ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/content/drive/MyDrive/synthER/synther/diffusion/elucidated_diffusion.py", line 178, in sample
+    sigma, sigma_next, gamma = map(lambda t: t.item(), (sigma, sigma_next, gamma))
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/content/drive/MyDrive/synthER/synther/diffusion/elucidated_diffusion.py", line 178, in <lambda>
+    sigma, sigma_next, gamma = map(lambda t: t.item(), (sigma, sigma_next, gamma))
+                                             ^^^^^^^^
+KeyboardInterrupt

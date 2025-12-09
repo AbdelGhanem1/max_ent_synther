@@ -1,0 +1,50 @@
+{
+  "os": "Linux-6.6.105+-x86_64-with-glibc2.35",
+  "python": "CPython 3.12.12",
+  "startedAt": "2025-12-08T16:50:11.784471Z",
+  "args": [
+    "--dataset",
+    "hopper-medium-replay-v2",
+    "--load_checkpoint",
+    "./results/model-100000.pt",
+    "--results_folder",
+    "./results_smeme",
+    "--gin_config_files",
+    "./config/resmlp_denoiser.gin",
+    "--smeme_step_size",
+    "0.1",
+    "--train_num_steps",
+    "10000"
+  ],
+  "program": "/content/drive/MyDrive/synthER/synther/diffusion/train_smeme.py",
+  "codePath": "synther/diffusion/train_smeme.py",
+  "codePathLocal": "synther/diffusion/train_smeme.py",
+  "email": "ghanem96abdelghani@gmail.com",
+  "root": "/content/drive/MyDrive/synthER",
+  "host": "c566f00839b6",
+  "executable": "/usr/bin/python3",
+  "cpu_count": 1,
+  "cpu_count_logical": 2,
+  "gpu": "Tesla T4",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "120942624768",
+      "used": "41496928256"
+    }
+  },
+  "memory": {
+    "total": "13605842944"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "Tesla T4",
+      "memoryTotal": "16106127360",
+      "cudaCores": 2560,
+      "architecture": "Turing",
+      "uuid": "GPU-8ac2475e-d366-cca1-f04b-f6a781272b27"
+    }
+  ],
+  "cudaVersion": "12.4",
+  "writerId": "l8j9hyrwpuwgx2eodhfn8gqyi8y0nedh"
+}

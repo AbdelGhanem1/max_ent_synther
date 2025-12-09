@@ -1,0 +1,42 @@
+{
+  "os": "Linux-6.6.105+-x86_64-with-glibc2.35",
+  "python": "CPython 3.12.12",
+  "startedAt": "2025-12-08T11:30:21.808440Z",
+  "args": [
+    "--dataset",
+    "hopper-medium-replay-v2",
+    "--gin_config_files",
+    "./config/resmlp_denoiser.gin"
+  ],
+  "program": "/content/drive/MyDrive/synthER/synther/diffusion/train_diffuser.py",
+  "codePath": "synther/diffusion/train_diffuser.py",
+  "codePathLocal": "synther/diffusion/train_diffuser.py",
+  "email": "ghanem96abdelghani@gmail.com",
+  "root": "/content/drive/MyDrive/synthER",
+  "host": "0ea1e5690888",
+  "executable": "/usr/bin/python3",
+  "cpu_count": 1,
+  "cpu_count_logical": 2,
+  "gpu": "Tesla T4",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "120942624768",
+      "used": "41085104128"
+    }
+  },
+  "memory": {
+    "total": "13605851136"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "Tesla T4",
+      "memoryTotal": "16106127360",
+      "cudaCores": 2560,
+      "architecture": "Turing",
+      "uuid": "GPU-59f5ec4f-d27c-82c5-8eb9-5b1d28ea0a19"
+    }
+  ],
+  "cudaVersion": "12.4",
+  "writerId": "8n4cbsm1r3mhpcackabky8b8209cjy76"
+}
