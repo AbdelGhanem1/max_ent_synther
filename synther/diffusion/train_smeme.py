@@ -9,12 +9,16 @@ import torch
 import torch.nn as nn
 import gin
 import wandb
-from dataclasses import dataclass, field # <--- Added 'field'
+from dataclasses import dataclass, field
 
 # Existing infrastructure
 from synther.diffusion.utils import construct_diffusion_model
 from synther.diffusion.elucidated_diffusion import ElucidatedDiffusion
 from just_d4rl import d4rl_offline_dataset
+
+# FIX: Import SimpleDiffusionGenerator to register it with GIN
+# This prevents the "No configurable matching 'SimpleDiffusionGenerator'" error
+from synther.diffusion.train_diffuser import SimpleDiffusionGenerator
 
 # The SOTA Solvers we built
 # Ensure these files exist in synther/diffusion/
@@ -37,7 +41,7 @@ class SMEMEConfig:
     # Decreasing regularization schedule (Alpha)
     # High alpha = close to base model. Low alpha = maximize entropy.
     alpha_schedule: tuple = (1.0, 0.5, 0.1) 
-    # FIX: Use default_factory for mutable defaults
+    # Use default_factory for mutable defaults
     am_config: AdjointMatchingConfig = field(default_factory=AdjointMatchingConfig)
 
 
