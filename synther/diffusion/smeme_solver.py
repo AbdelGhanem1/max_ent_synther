@@ -1,5 +1,8 @@
 import torch
 import copy
+import numpy as np
+from tqdm import tqdm
+import wandb
 from adjoint_matching_solver import AdjointMatchingSolver
 
 class SMEMESolver:
@@ -26,25 +29,8 @@ class SMEMESolver:
     def _get_score_at_data(self, model, x_data, t_idx):
         """
         Computes the Score Function s(x, t) at the data level.
-        
         Equation: s(x, t) = -epsilon(x, t) / sqrt(1 - alpha_bar_t)
-        
-        Crucial Engineering Detail:
-        Directly evaluating score at t=0 (data) is numerically unstable because
-        sqrt(1 - alpha_bar_0) is 0 or very small.
-        
-        We rely on the "Noiseless Trick" context from the solver:
-        The solver passes us a 'clean' x computed from the penultimate step.
-        We evaluate the score using the noise prediction parameters for that step.
         """
-        # We need the scheduler to get alpha_bar
-        # We can borrow the scheduler from the solver instance later, 
-        # or create a temporary one.
-        # Assuming the model wrapper handles t_idx correctly.
-        
-        # In S-MEME, we use the score of the PREVIOUS model as the gradient.
-        # The solver provides x_final_clean.
-        
         t_tensor = torch.tensor([t_idx], device=x_data.device).repeat(x_data.shape[0])
         
         with torch.no_grad():
@@ -52,11 +38,6 @@ class SMEMESolver:
             eps = model(x_data, t_tensor)
             
             # 2. Get Scaling Factor (1 / sqrt(1 - alpha_bar))
-            # We need the alpha_bar for this specific timestep.
-            # Ideally, access the scheduler from the solver.
-            # For now, we compute it assuming the standard linear schedule provided in config.
-            # (In a real codebase, pass the scheduler instance).
-            
             # Replicating scheduler logic for alpha_bar
             num_train_timesteps = self.config.am_config.num_train_timesteps
             betas = torch.linspace(0.0001, 0.02, num_train_timesteps, device=x_data.device)
@@ -77,16 +58,16 @@ class SMEMESolver:
         """
         print(f"Starting S-MEME with K={self.config.num_smeme_iterations} iterations.")
         
+        total_steps = 0
+        
         for k in range(self.config.num_smeme_iterations):
-            print(f"=== S-MEME Iteration {k+1}/{self.config.num_smeme_iterations} ===")
+            print(f"\n=== S-MEME Iteration {k+1}/{self.config.num_smeme_iterations} ===")
             
             # 1. Setup the Linear Solver for this iteration
-            # We use a subclass that accepts a vector field instead of a scalar reward
-            
-            # Get alpha for this step (Regularization coefficient)
-            # Reward Multiplier in Adjoint Matching is 1/alpha
             alpha = self.config.alpha_schedule[k]
             self.config.am_config.reward_multiplier = 1.0 / alpha
+            
+            print(f"   > Alpha: {alpha} (Reward Multiplier: {self.config.am_config.reward_multiplier:.2f})")
             
             solver = VectorFieldAdjointSolver(
                 model_pre=self.previous_model, # Regularization target (Previous model)
@@ -95,43 +76,59 @@ class SMEMESolver:
             )
             
             # 2. Define the "Reward Gradient" function
-            # This corresponds to line 3 in Algorithm 1: "Set grad f_k = -s^{k-1}"
-            # The solver expects a function that takes (x, t_idx) and returns a vector.
             def entropy_gradient_fn(x, t_idx):
-                # Gradient of Entropy = -Score
-                # But we want Gradient Ascent on Reward.
-                # Reward = Entropy. 
-                # Gradient of Reward = Gradient of Entropy = -Score.
-                # So we return -Score.
-                
+                # Return -Score (Gradient Ascent direction for Entropy)
                 score = self._get_score_at_data(self.previous_model, x, t_idx)
-                return -score # This is the gradient vector
+                return -score 
             
-            # 3. Inner Loop: Solve the Linear Fine-tuning Problem
-            # Iterate over data batches (or just noise batches)
-            # S-MEME generates its own data starting from noise.
+            # 3. Inner Loop with Progress Bar
+            # We iterate over the finite loader provided by train_smeme.py
             
-            for step, batch in enumerate(train_loader):
-                # x_0 is pure noise here
-                noise = torch.randn_like(batch) 
+            pbar = tqdm(train_loader, desc=f"Iter {k+1}", dynamic_ncols=True)
+            running_loss = 0.0
+            
+            for step, batch in enumerate(pbar):
+                # batch is purely noise here
                 
                 # Zero grad
                 self.current_model.zero_grad()
                 
                 # Execute Solver
-                loss = solver.solve_vector_field(noise, entropy_gradient_fn)
+                loss = solver.solve_vector_field(batch, entropy_gradient_fn)
                 
                 # Update Weights
                 loss.backward()
-                # Gradient clipping is standard in diffusion training
                 torch.nn.utils.clip_grad_norm_(self.current_model.parameters(), 1.0)
-                # optimizer.step() (Assuming optimizer is managed externally or passed in)
                 
-                # Log progress...
+                # Assuming standard optimizer stepping is handled outside 
+                # OR we implement simple SGD/Adam here if not passed.
+                # Since we didn't pass an optimizer to this class, we MUST create one.
+                # Standard practice: create a new optimizer for each S-MEME iteration 
+                # (or maintain one, but let's be safe).
+                if not hasattr(self, 'optimizer'):
+                    # Use standard AdamW defaults from paper
+                    self.optimizer = torch.optim.AdamW(self.current_model.parameters(), lr=1e-4, weight_decay=1e-2)
+                
+                self.optimizer.step()
+                
+                # Logging
+                loss_val = loss.item()
+                running_loss = 0.9 * running_loss + 0.1 * loss_val if step > 0 else loss_val
+                
+                pbar.set_postfix({'loss': f"{running_loss:.4f}"})
+                
+                if wandb.run is not None:
+                    wandb.log({
+                        "smeme/loss": loss_val,
+                        "smeme/iteration": k + 1,
+                        "smeme/alpha": alpha,
+                        "total_steps": total_steps
+                    })
+                
+                total_steps += 1
                 
             # 4. Update "Previous Model"
-            # Algorithm 1 Line 5: pi_{k-1} <- pi_k
-            # We freeze the current state of the model to serve as the reference for the next step.
+            # Freeze current state as reference for next iteration
             self.previous_model.load_state_dict(self.current_model.state_dict())
             self.previous_model.eval()
             self.previous_model.requires_grad_(False)
@@ -151,7 +148,6 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
         Args:
             vector_field_fn: Function(x, t_idx) -> Tensor (Gradient Vector)
         """
-        # ... [Reuse initialization logic from parent] ...
         device = x_0.device
         batch_size = x_0.shape[0]
         timesteps = torch.linspace(
@@ -178,10 +174,6 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
         x_prev = traj[-2]
         t_last = timesteps[-1].item()
         
-        # Noiseless update to get clean x
-        # Note: We don't need gradients on x_prev here because we aren't backpropagating 
-        # through a scalar reward function. We just need the value x_final_clean 
-        # to query the vector field.
         with torch.no_grad():
             t_tensor = torch.tensor([t_last], device=device).repeat(batch_size)
             noise_pred = self.model_fine(x_prev, t_tensor, prompt_emb)
@@ -191,14 +183,10 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             )
             
             # --- DIFFERENCE IS HERE ---
-            # Instead of: r = reward(x); r.backward()
-            # We call the vector field function directly.
-            
-            # Get the gradient vector (Negative Score) from the previous model
+            # Get the gradient vector (Negative Score) directly
             reward_grad = vector_field_fn(x_final_clean, t_last)
             
         # Continue with standard logic
-        # Initialize Adjoint State
         adjoint_state = -self.config.reward_multiplier * reward_grad
         
         # 3. Backward Pass (Same as parent)
@@ -211,10 +199,6 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             adjoint_storage[k] = adjoint_state
             
         # 4. Loss Computation (Same as parent)
-        # ... [Call parent loss logic or copy-paste if reuse is hard] ...
-        # For conciseness, assuming we can reuse or copy the loss block here.
-        
-        # (Copying the loss block from previous response to ensure self-contained correctness)
         active_indices = self._sample_time_indices(
             self.config.num_inference_steps, 
             self.config.num_timesteps_to_load, 
