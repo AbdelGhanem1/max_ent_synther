@@ -184,22 +184,22 @@ if __name__ == '__main__':
             
     # Simple iterator wrapper
     # Simple iterator wrapper
-        class InfiniteNoiseLoader:
-            def __init__(self, generator, limit):
-                self.gen = generator
-                self.limit = limit
-                self.cnt = 0
-                
-            def __iter__(self):
-                # FIX: Reset counter when a new loop starts
-                self.cnt = 0
-                return self
-                
-            def __next__(self):
-                if self.cnt >= self.limit:
-                    raise StopIteration
-                self.cnt += 1
-                return next(self.gen)
+    class InfiniteNoiseLoader:
+        def __init__(self, generator, limit):
+            self.gen = generator
+            self.limit = limit
+            self.cnt = 0
+            
+        def __iter__(self):
+            # FIX: Reset counter when a new loop starts
+            self.cnt = 0
+            return self
+            
+        def __next__(self):
+            if self.cnt >= self.limit:
+                raise StopIteration
+            self.cnt += 1
+            return next(self.gen)
             
     train_loader = InfiniteNoiseLoader(noise_generator(), args.steps_per_iter)
     
