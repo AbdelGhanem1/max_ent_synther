@@ -25,11 +25,12 @@ from synther.diffusion.train_diffuser import SimpleDiffusionGenerator
 from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
 from synther.diffusion.smeme_solver import SMEMESolver
 
+@gin.configurable
 @dataclass
 class AdjointMatchingConfig:
     """Configuration corresponding to Paper Appendix H details"""
     num_train_timesteps: int = 1000      # Discretization of the ODE
-    num_inference_steps: int = 40        # K in the paper (step size h = 1/K)
+    num_inference_steps: int = 20        # K in the paper (step size h = 1/K)
     num_timesteps_to_load: int = 40      # Batch size for stratified sampling
     per_sample_threshold_quantile: float = 0.9 # For EMA clipping
     reward_multiplier: float = 1.0       # Will be overwritten by 1/alpha
