@@ -4,15 +4,16 @@ import argparse
 import torch
 import numpy as np
 import gymnasium as gym  # Using gymnasium instead of gym
-import gin  # <--- Added missing import
+import gin
 from tqdm import tqdm
 from scipy.spatial.distance import cdist
 import copy
+import sys
 
 # Import your custom modules
 from synther.diffusion.utils import construct_diffusion_model
 from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
-from synther.diffusion.train_smeme import DiffusionModelAdapter, AdjointMatchingConfig
+from synther.diffusion.train_smeme import DiffusionModelAdapter, AdjointMatchingConfig, SMEMEConfig
 from just_d4rl import d4rl_offline_dataset
 
 def get_device():
@@ -216,12 +217,15 @@ def load_models(args, device):
     
     # 3. Load Weights
     print(f"Loading Base Model from {args.base_checkpoint}...")
-    base_ckpt = torch.load(args.base_checkpoint, map_location='cpu')
+    # FIX: weights_only=False to allow potential legacy objects or numpy arrays
+    base_ckpt = torch.load(args.base_checkpoint, map_location='cpu', weights_only=False)
     base_model.load_state_dict(base_ckpt['model'] if 'model' in base_ckpt else base_ckpt)
     base_model.to(device)
     
     print(f"Loading S-MEME Model from {args.smeme_checkpoint}...")
-    smeme_ckpt = torch.load(args.smeme_checkpoint, map_location='cpu')
+    # FIX: weights_only=False is REQUIRED here because the checkpoint contains
+    # pickled dataclasses (SMEMEConfig) which are not pure weights.
+    smeme_ckpt = torch.load(args.smeme_checkpoint, map_location='cpu', weights_only=False)
     smeme_model.load_state_dict(smeme_ckpt['model'] if 'model' in smeme_ckpt else smeme_ckpt)
     smeme_model.to(device)
     
@@ -232,6 +236,15 @@ def load_models(args, device):
 # ============================================================================
 
 if __name__ == "__main__":
+    
+    # HACK: If SMEMEConfig was saved as '__main__.SMEMEConfig', we map it here
+    # so pickle can find it.
+    try:
+        sys.modules['__main__'].SMEMEConfig = SMEMEConfig
+        sys.modules['__main__'].AdjointMatchingConfig = AdjointMatchingConfig
+    except:
+        pass
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, required=True, help="D4RL environment name")
     parser.add_argument('--base_checkpoint', type=str, required=True, help="Original Synther model")
