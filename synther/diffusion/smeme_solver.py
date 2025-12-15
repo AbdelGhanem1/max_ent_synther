@@ -79,7 +79,7 @@ class SMEMESolver:
             def entropy_gradient_fn(x, t_idx):
                 # Return -Score (Gradient Ascent direction for Entropy)
                 score = self._get_score_at_data(self.previous_model, x, t_idx)
-                return -score 
+                return score 
             
             # 3. Inner Loop with Progress Bar
             # We iterate over the finite loader provided by train_smeme.py
