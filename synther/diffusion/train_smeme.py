@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import gin
 import wandb
-from dataclasses import dataclass
+from dataclasses import dataclass, field # <--- Added 'field'
 
 # Existing infrastructure
 from synther.diffusion.utils import construct_diffusion_model
@@ -17,6 +17,7 @@ from synther.diffusion.elucidated_diffusion import ElucidatedDiffusion
 from just_d4rl import d4rl_offline_dataset
 
 # The SOTA Solvers we built
+# Ensure these files exist in synther/diffusion/
 from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
 from synther.diffusion.smeme_solver import SMEMESolver
 
@@ -36,7 +37,8 @@ class SMEMEConfig:
     # Decreasing regularization schedule (Alpha)
     # High alpha = close to base model. Low alpha = maximize entropy.
     alpha_schedule: tuple = (1.0, 0.5, 0.1) 
-    am_config: AdjointMatchingConfig = AdjointMatchingConfig()
+    # FIX: Use default_factory for mutable defaults
+    am_config: AdjointMatchingConfig = field(default_factory=AdjointMatchingConfig)
 
 
 class DiffusionModelAdapter(nn.Module):
@@ -61,11 +63,6 @@ class DiffusionModelAdapter(nn.Module):
         Calculates sigma for a given integer timestep index k.
         t_continuous = k * h
         """
-        # t_idx is roughly [0, 1000]. We map to [0, 1] based on K steps.
-        # The solver passes indices relevant to num_inference_steps (e.g. 0..40)
-        # IF the solver passed raw indices 0..1000, we map differently.
-        # Looking at AdjointMatchingSolver: it uses `timesteps = linspace(1000, 0, 40)`.
-        
         # Map integer index [0, 1000] -> continuous t [0, 1]
         t_continuous = t_idx_tensor.float() / self.config.num_train_timesteps
         
@@ -86,14 +83,10 @@ class DiffusionModelAdapter(nn.Module):
         sigmas = self.get_sigma_at_step(t_idx)
         
         # 2. Reshape for broadcasting
-        # ElucidatedDiffusion expects sigmas shape (Batch,) usually, 
-        # but internal network might expect (Batch, 1)
         sigmas = sigmas.view(x.shape[0])
         
         # 3. Forward pass through Pre-trained EDM Model
         # ElucidatedDiffusion.preconditioned_network_forward outputs D(x, sigma) (Denoised data)
-        # Note: We must ensure we don't accidentally add more noise or compute loss.
-        # We use the underlying preconditioned call.
         denoised_x = self.model.preconditioned_network_forward(x, sigmas, clamp=False)
         
         # 4. Convert Denoised Data -> Epsilon
@@ -124,6 +117,9 @@ if __name__ == '__main__':
     parser.add_argument('--gin_params', nargs='*', type=str, default=[])
     parser.add_argument('--seed', type=int, default=0)
     
+    # WANDB args (optional compatibility)
+    parser.add_argument('--wandb-project', type=str, default="smeme-finetuning")
+    
     args = parser.parse_args()
 
     # 1. Setup
@@ -136,8 +132,6 @@ if __name__ == '__main__':
     results_folder.mkdir(parents=True, exist_ok=True)
 
     # 2. Data Loading (For shape and normalization context)
-    # Even though S-MEME generates data from noise, we need the dataset 
-    # to construct the model architecture correctly (dim size) and normalization stats.
     print(f"Loading dataset info for {args.dataset}...")
     d4rl_dataset = d4rl_offline_dataset(args.dataset)
     obs = d4rl_dataset['observations']
@@ -148,16 +142,10 @@ if __name__ == '__main__':
     
     # Concatenate to determine input dimension
     inputs_np = np.concatenate([obs, act, rew, next_obs, term], axis=1)
-    # We don't necessarily need a TensorDataset for training if we generate noise on the fly,
-    # but the Solver expects a DataLoader-like structure for the inner loop.
-    
-    # Creates a dummy loader that just yields noise (or real data if we wanted support constraints)
-    # For Pure S-MEME, we just need the shape.
     input_dim = inputs_np.shape[1]
     print(f"Data Dimension: {input_dim}")
 
     # 3. Model Construction & Loading
-    # Construct base model structure
     dummy_inputs = torch.zeros(1, input_dim)
     base_model_edm = construct_diffusion_model(inputs=dummy_inputs)
     
@@ -165,15 +153,11 @@ if __name__ == '__main__':
     checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
     state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
     
-    # Load weights
     base_model_edm.load_state_dict(state_dict)
     base_model_edm.to(device)
     base_model_edm.eval() # Freeze stats
 
     # 4. Wrap the Model for Adjoint Matching
-    # This converts the EDM (Denoising) model into a DDPM (Epsilon) interface
-    # compatible with our solver.
-    
     am_config = AdjointMatchingConfig()
     wrapped_model = DiffusionModelAdapter(base_model_edm, am_config).to(device)
     
@@ -185,24 +169,17 @@ if __name__ == '__main__':
     )
     
     # 6. Initialize Solver
-    # SMEMESolver expects the wrapped model (epsilon predictor)
     solver = SMEMESolver(base_model=wrapped_model, config=smeme_config)
     
-    # 7. Training Loop
-    # We construct a generator that yields random noise batches
-    def noise_generator(batch_size, dim):
+    # 7. Training Loop Generator
+    def noise_generator():
         while True:
-            yield torch.randn(batch_size, dim).to(device)
+            yield torch.randn(args.batch_size, input_dim).to(device)
             
-    # We essentially manually run the solver's internal loop control
-    # relying on the SMEMESolver structure provided previously.
-    
-    # HACK: The SMEMESolver.train expects a loader. 
-    # We create a finite iterator for the number of steps requested.
+    # Simple iterator wrapper
     class InfiniteNoiseLoader:
-        def __init__(self, batch_size, dim, limit):
-            self.batch_size = batch_size
-            self.dim = dim
+        def __init__(self, generator, limit):
+            self.gen = generator
             self.limit = limit
             self.cnt = 0
         def __iter__(self):
@@ -211,19 +188,18 @@ if __name__ == '__main__':
             if self.cnt >= self.limit:
                 raise StopIteration
             self.cnt += 1
-            return torch.randn(self.batch_size, self.dim).to(device)
+            return next(self.gen)
             
-    train_loader = InfiniteNoiseLoader(args.batch_size, input_dim, args.steps_per_iter)
+    train_loader = InfiniteNoiseLoader(noise_generator(), args.steps_per_iter)
     
+    if args.wandb_project:
+        wandb.init(project=args.wandb_project, config=args)
+
     print("Starting S-MEME Training...")
-    
-    # Run S-MEME
-    # This returns the fine-tuned Wrapped Model
     finetuned_wrapper = solver.train(train_loader)
     
     # 8. Save Results
-    # We need to extract the underlying EDM model state dict to stay compatible with Synther
-    finetuned_edm = finetuned_wrapper.current_model.model # Unwrap Adapter -> ElucidatedDiffusion
+    finetuned_edm = finetuned_wrapper.current_model.model 
     
     save_path = results_folder / "smeme_finetuned.pt"
     torch.save({
