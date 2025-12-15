@@ -150,8 +150,10 @@ if __name__ == '__main__':
     print(f"Data Dimension: {input_dim}")
 
     # 3. Model Construction & Loading
-    dummy_inputs = torch.zeros(1, input_dim)
-    base_model_edm = construct_diffusion_model(inputs=dummy_inputs)
+    full_dataset_tensor = torch.from_numpy(inputs_np).float()
+    
+    # Construct model using real data stats
+    base_model_edm = construct_diffusion_model(inputs=full_dataset_tensor)
     
     print(f"Loading weights from {args.load_checkpoint}...")
     checkpoint = torch.load(args.load_checkpoint, map_location='cpu')

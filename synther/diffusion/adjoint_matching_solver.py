@@ -20,7 +20,7 @@ class DDIMScheduler:
              timestep: int, 
              sample: torch.Tensor, 
              eta: float = 0.0,
-             num_inference_steps: int = 40) -> Tuple[torch.Tensor, torch.Tensor]:
+             num_inference_steps: int = 40) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Performs one backward step (generation) from t to t-1.
         Matches 'SOCDDIMScheduler.step'.
@@ -28,6 +28,7 @@ class DDIMScheduler:
         Returns:
             prev_sample (x_{t-1})
             pred_original_sample (x_0 prediction)
+            std_dev_t (sigma_t for this step)
         """
         # 1. Calculate step indices
         # In generation, timestep is the high value (e.g. 975), prev is lower (e.g. 950)
@@ -118,20 +119,33 @@ class AdjointMatchingSolver:
         """
         Stratified Sampling (am_trainer.py: sample_time_indices).
         Splits at 60% of process. Samples half from early (noisy), half from late (structure).
+        
+        FIX: Handles cases where requested sample size exceeds population size.
         """
+        # If we want to load everything (or more), just return all indices
+        if num_to_load >= num_timesteps:
+            return torch.arange(num_timesteps, device=device, dtype=torch.long)
+
         middle_timestep = round(num_timesteps * 0.6)
         
-        # Early timesteps (Indices 0 to mid)
-        indices_1 = np.random.choice(
-            np.arange(0, middle_timestep), num_to_load // 2, replace=False
-        )
+        # Define populations
+        pop1 = np.arange(0, middle_timestep)
+        pop2 = np.arange(middle_timestep, num_timesteps)
         
-        # Late timesteps (Indices mid to end)
-        indices_2 = np.random.choice(
-            np.arange(middle_timestep, num_timesteps), 
-            num_to_load - num_to_load // 2, 
-            replace=False
-        )
+        # Define goals (try to split 50/50)
+        goal_1 = num_to_load // 2
+        goal_2 = num_to_load - goal_1
+        
+        # Adjust goals if populations are too small
+        # If pop2 is too small for goal_2, take all of pop2 and add remainder to goal_1
+        count_2 = min(len(pop2), goal_2)
+        remainder = goal_2 - count_2
+        
+        count_1 = min(len(pop1), goal_1 + remainder)
+        
+        # Sampling
+        indices_1 = np.random.choice(pop1, count_1, replace=False)
+        indices_2 = np.random.choice(pop2, count_2, replace=False)
         
         indices = np.concatenate((indices_1, indices_2))
         return torch.tensor(np.sort(indices), dtype=torch.long, device=device)
