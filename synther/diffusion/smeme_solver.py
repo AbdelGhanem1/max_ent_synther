@@ -4,7 +4,9 @@ import numpy as np
 from tqdm import tqdm
 import wandb
 from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
-from torch.cuda.amp import autocast, GradScaler # <--- NEW: For Mixed Precision
+
+# FIX: Use new PyTorch 2.x AMP imports to avoid warnings
+from torch.amp import autocast, GradScaler 
 
 class SMEMESolver:
     def __init__(self, base_model, config):
@@ -14,22 +16,13 @@ class SMEMESolver:
         self.current_model = base_model
         self.config = config
         
+        # Create the reference model (Previous Iteration)
         self.previous_model = copy.deepcopy(base_model)
         self.previous_model.eval()
         self.previous_model.requires_grad_(False)
         
-        # --- OPTIMIZATION 1: PyTorch 2.0 Compilation ---
-        # If available, we compile the underlying backbone model.
-        # This fuses kernels and speeds up the tight ODE loop significantly.
-        if hasattr(torch, "compile"):
-            print("⚡ PyTorch 2.0 detected. Compiling models for speed...")
-            try:
-                # We compile the .model attribute (the actual ResMLP/UNet)
-                # mode='reduce-overhead' is best for small batches/loops
-                self.current_model.model = torch.compile(self.current_model.model, mode='reduce-overhead')
-                self.previous_model.model = torch.compile(self.previous_model.model, mode='reduce-overhead')
-            except Exception as e:
-                print(f"⚠️ Compilation failed (continuing without): {e}")
+        # NOTE: Removed torch.compile as it was breaking the gradient graph.
+        # AMP (autocast) below provides the majority of the speedup safely.
 
     def _get_score_at_data(self, model, x_data, t_idx):
         """
@@ -39,7 +32,8 @@ class SMEMESolver:
         t_tensor = torch.tensor([t_idx], device=x_data.device).repeat(x_data.shape[0])
         
         with torch.no_grad():
-            with autocast(): # <--- NEW: Run inference in FP16
+            # Use 'cuda' device type for autocast
+            with autocast(device_type='cuda'): 
                 eps = model(x_data, t_tensor)
                 score = -eps 
             
@@ -48,8 +42,8 @@ class SMEMESolver:
     def train(self, train_loader):
         print(f"Starting S-MEME with K={self.config.num_smeme_iterations} iterations.")
         
-        # --- OPTIMIZATION 2: GradScaler for AMP ---
-        scaler = GradScaler()
+        # Initialize Scaler for Mixed Precision
+        scaler = GradScaler('cuda')
         
         total_steps = 0
         
@@ -78,13 +72,16 @@ class SMEMESolver:
             for step, batch in enumerate(pbar):
                 self.current_model.zero_grad()
                 
-                # --- OPTIMIZATION 3: Mixed Precision Context ---
-                # Runs the entire ODE solve (Forward + Adjoint) in FP16/BF16
-                with autocast():
+                # --- OPTIMIZATION: Mixed Precision Context ---
+                with autocast(device_type='cuda'):
                     loss = solver.solve_vector_field(batch, entropy_gradient_fn)
                 
-                # --- OPTIMIZATION 4: Scaled Backward Pass ---
-                # Prevents underflow of small gradients in FP16
+                # --- Check for NaN ---
+                if torch.isnan(loss):
+                    print(f"⚠️ Warning: Loss is NaN at step {step}. Skipping update.")
+                    continue
+                
+                # --- OPTIMIZATION: Scaled Backward Pass ---
                 scaler.scale(loss).backward()
                 
                 # Unscale before clipping
@@ -114,6 +111,7 @@ class SMEMESolver:
                 
                 total_steps += 1
                 
+            # Update Reference Model
             self.previous_model.load_state_dict(self.current_model.state_dict())
             self.previous_model.eval()
             self.previous_model.requires_grad_(False)
@@ -164,7 +162,6 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
                 num_inference_steps=self.config.num_inference_steps
             )
             
-            # The vector field calc might need autocast context too, but usually inherits
             reward_grad = vector_field_fn(x_final_clean, 0)
             
         adjoint_state = -self.config.reward_multiplier * reward_grad
@@ -184,7 +181,8 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             self.config.num_timesteps_to_load, 
             device
         )
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=device) # Ensure it's a tensor
+        
         for k in active_indices:
             k = k.item()
             t_val = timesteps[k].item()
@@ -209,6 +207,6 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             ema_threshold = self._ema_update(current_quantile)
             mask = (loss_root < ema_threshold).float()
             
-            total_loss += (loss_per_sample * mask).mean()
+            total_loss = total_loss + (loss_per_sample * mask).mean()
             
         return total_loss
