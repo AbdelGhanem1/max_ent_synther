@@ -1,272 +1,235 @@
 # synther/diffusion/train_smeme.py
 
 import argparse
-import copy
 import pathlib
-import gin
-import torch
-import torch.nn.functional as F
-import wandb
+import copy
+import json
 import numpy as np
-from tqdm import tqdm
-from accelerate import Accelerator
-from einops import reduce
+import torch
+import torch.nn as nn
+import gin
+import wandb
+from dataclasses import dataclass
 
-# Import existing infrastructure to ensure compatibility
-from synther.diffusion.elucidated_diffusion import Trainer
+# Existing infrastructure
 from synther.diffusion.utils import construct_diffusion_model
-from synther.diffusion.train_diffuser import get_gymnasium_id
+from synther.diffusion.elucidated_diffusion import ElucidatedDiffusion
 from just_d4rl import d4rl_offline_dataset
 
-@gin.configurable
-class SMEMETrainer(Trainer):
+# The SOTA Solvers we built
+from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
+from synther.diffusion.smeme_solver import SMEMESolver
+
+@dataclass
+class AdjointMatchingConfig:
+    """Configuration corresponding to Paper Appendix H details"""
+    num_train_timesteps: int = 1000      # Discretization of the ODE
+    num_inference_steps: int = 40        # K in the paper (step size h = 1/K)
+    num_timesteps_to_load: int = 40      # Batch size for stratified sampling
+    per_sample_threshold_quantile: float = 0.9 # For EMA clipping
+    reward_multiplier: float = 1.0       # Will be overwritten by 1/alpha
+    eta: float = 1.0                     # Sampling stochasticity (1.0 = full noise)
+
+@dataclass
+class SMEMEConfig:
+    num_smeme_iterations: int = 3
+    # Decreasing regularization schedule (Alpha)
+    # High alpha = close to base model. Low alpha = maximize entropy.
+    alpha_schedule: tuple = (1.0, 0.5, 0.1) 
+    am_config: AdjointMatchingConfig = AdjointMatchingConfig()
+
+
+class DiffusionModelAdapter(nn.Module):
     """
-    State-of-the-art S-MEME Trainer adapted for Elucidated Diffusion (Karras et al.).
+    CRITICAL ADAPTER: Bridges the gap between Adjoint Matching (DDPM-style)
+    and Elucidated Diffusion (EDM/Karras-style).
     
-    Implements the update rule:
-        Target_Score = (1 - lambda) * Reference_Score
-    
-    In terms of the denoiser output D(x):
-        D_target(x) = x + (1 - lambda) * (D_ref(x) - x)
+    1. Translates Solver Time (t_idx) -> Adjoint Matching Sigma -> Model Input.
+    2. Translates Model Output (Denoised X) -> Noise Prediction (Epsilon).
     """
-    def __init__(
-        self,
-        diffusion_model,
-        ref_model,
-        smeme_step_size: float = 0.1, # The 'lambda' parameter
-        **kwargs
-    ):
-        super().__init__(diffusion_model, **kwargs)
-        self.smeme_step_size = smeme_step_size
+    def __init__(self, elucidated_model: ElucidatedDiffusion, solver_config: AdjointMatchingConfig):
+        super().__init__()
+        self.model = elucidated_model
+        self.config = solver_config
         
-        # Prepare Reference Model
-        # We assume ref_model is already loaded with weights
-        self.ref_model = ref_model
-        self.ref_model.eval()
-        self.ref_model.requires_grad_(False)
-        
-        # Move ref_model to correct device immediately if possible, 
-        # though accelerator handles the main model.
-        # We will handle ref_model placement dynamically in the loop or here.
-        self.ref_model.to(self.accelerator.device)
+        # We need the EXACT sigma schedule used by the solver to ensure consistency.
+        # sigma(t) = sqrt( 2(1 - t + h) / (t + h) ) [Paper Eq 235]
+        self.h = 1.0 / self.config.num_inference_steps
 
-    def smeme_loss(self, inputs):
+    def get_sigma_at_step(self, t_idx_tensor):
         """
-        Computes the S-MEME fine-tuning loss.
+        Calculates sigma for a given integer timestep index k.
+        t_continuous = k * h
         """
-        # 1. Standard Elucidated Diffusion Setup
-        inputs = self.model.normalizer.normalize(inputs)
-        batch_size = inputs.shape[0]
+        # t_idx is roughly [0, 1000]. We map to [0, 1] based on K steps.
+        # The solver passes indices relevant to num_inference_steps (e.g. 0..40)
+        # IF the solver passed raw indices 0..1000, we map differently.
+        # Looking at AdjointMatchingSolver: it uses `timesteps = linspace(1000, 0, 40)`.
         
-        # Sample noise levels (sigmas) - Same log-normal dist as training
-        sigmas = self.model.noise_distribution(batch_size)
-        padded_sigmas = sigmas.view(batch_size, *([1] * len(self.model.event_shape)))
+        # Map integer index [0, 1000] -> continuous t [0, 1]
+        t_continuous = t_idx_tensor.float() / self.config.num_train_timesteps
         
-        # Add noise
-        noise = torch.randn_like(inputs)
-        noised_inputs = inputs + padded_sigmas * noise
-        
-        # 2. Compute Reference Output (Gradient-Free)
-        with torch.no_grad():
-            # Ensure ref_model is on the same device as inputs
-            # (Accelerate might have moved inputs to a specific GPU)
-            if self.ref_model.device != inputs.device:
-                self.ref_model.to(inputs.device)
-                
-            # Get D_ref(x_t)
-            # We use preconditioned_network_forward to get the raw denoiser output
-            denoised_ref = self.ref_model.preconditioned_network_forward(
-                noised_inputs, sigmas, clamp=False
-            )
-            
-        # 3. Compute S-MEME Target
-        # Formula: D_target = x_t + (1 - lambda) * (D_ref - x_t)
-        # This dampens the score magnitude by lambda, increasing entropy.
-        
-        # (D_ref - x_t) is the "vector pointing to data".
-        # We scale this vector down.
-        score_direction = denoised_ref - noised_inputs
-        target = noised_inputs + (1.0 - self.smeme_step_size) * score_direction
-        
-        # 4. Compute Current Model Output
-        # We need to access the underlying model if it's wrapped by DDP/Accelerator
-        # But calling self.model(...) calls forward() which computes loss.
-        # We need to call the denoiser forward pass directly.
-        
-        # Unwrapping is tricky in training loop, but we can call the method directly 
-        # if the model exposes it. ElucidatedDiffusion does.
-        # If wrapped by DDP, methods are accessible via attributes or direct call if properly configured.
-        # However, safely, we can just call the method on self.model because DDP forwards calls.
-        
-        denoised_pred = self.model.preconditioned_network_forward(
-            noised_inputs, sigmas, clamp=False
-        )
-        
-        # 5. Compute Weighted Loss
-        # Karras weighting scheme: (sigma^2 + sigma_data^2) / (sigma * sigma_data)^2
-        weights = self.model.loss_weight(sigmas)
-        
-        losses = F.mse_loss(denoised_pred, target, reduction='none')
-        losses = reduce(losses, 'b ... -> b', 'mean')
-        losses = losses * weights
-        
-        return losses.mean()
+        numerator = 2 * (1 - t_continuous + self.h)
+        denominator = t_continuous + self.h
+        sigma = torch.sqrt(numerator / denominator)
+        return sigma
 
-    def train(self):
+    def forward(self, x, t_idx, prompt_emb=None):
         """
-        Custom training loop overriding the standard Trainer.train()
-        to use smeme_loss instead of standard diffusion loss.
+        Args:
+            x: Noisy input (Batch, Dim)
+            t_idx: Timestep indices (Batch,)
+        Returns:
+            pred_epsilon: Estimated noise (Batch, Dim)
         """
-        accelerator = self.accelerator
-        device = accelerator.device
-
-        print(f"Starting S-MEME Fine-tuning for {self.train_num_steps} steps...")
+        # 1. Calculate the sigma mandated by Adjoint Matching physics
+        sigmas = self.get_sigma_at_step(t_idx)
         
-        with tqdm(initial=self.step, total=self.train_num_steps, disable=not accelerator.is_main_process) as pbar:
-            while self.step < self.train_num_steps:
-                total_loss = 0.
-
-                for _ in range(self.gradient_accumulate_every):
-                    # Load batch from dataset (Manifold Support)
-                    data = (next(self.dl)[0]).to(device)
-
-                    with self.accelerator.autocast():
-                        # --- CRITICAL CHANGE: Use S-MEME Loss ---
-                        loss = self.smeme_loss(data)
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
-
-                    self.accelerator.backward(loss)
-
-                accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
-                
-                # Logging
-                pbar.set_description(f'S-MEME loss: {total_loss:.4f}')
-                wandb.log({
-                    'step': self.step,
-                    'loss': total_loss,
-                    'lr': self.opt.param_groups[0]['lr']
-                })
-
-                accelerator.wait_for_everyone()
-
-                self.opt.step()
-                self.opt.zero_grad()
-
-                accelerator.wait_for_everyone()
-
-                self.step += 1
-                
-                # EMA Update
-                if accelerator.is_main_process:
-                    self.ema.to(device)
-                    self.ema.update()
-
-                    # Save checkpoints
-                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                        self.save(self.step)
-
-                pbar.update(1)
-
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.step()
-
-        accelerator.print('S-MEME Fine-tuning complete.')
+        # 2. Reshape for broadcasting
+        # ElucidatedDiffusion expects sigmas shape (Batch,) usually, 
+        # but internal network might expect (Batch, 1)
+        sigmas = sigmas.view(x.shape[0])
+        
+        # 3. Forward pass through Pre-trained EDM Model
+        # ElucidatedDiffusion.preconditioned_network_forward outputs D(x, sigma) (Denoised data)
+        # Note: We must ensure we don't accidentally add more noise or compute loss.
+        # We use the underlying preconditioned call.
+        denoised_x = self.model.preconditioned_network_forward(x, sigmas, clamp=False)
+        
+        # 4. Convert Denoised Data -> Epsilon
+        # x = data + sigma * epsilon  =>  epsilon = (x - data) / sigma
+        
+        # Reshape sigma for broadcasting against x
+        sigmas_broad = sigmas.view(-1, *([1] * (x.ndim - 1)))
+        
+        pred_epsilon = (x - denoised_x) / (sigmas_broad + 1e-5) # Stability epsilon
+        
+        return pred_epsilon
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, required=True, help="D4RL dataset name (e.g., hopper-medium-replay-v2)")
-    parser.add_argument('--load_checkpoint', type=str, required=True, help="Path to the pre-trained model (e.g., results/model-100000.pt)")
-    parser.add_argument('--results_folder', type=str, default='./results_smeme', help="Folder to save fine-tuned model")
+    parser.add_argument('--dataset', type=str, required=True, help="D4RL dataset name")
+    parser.add_argument('--load_checkpoint', type=str, required=True, help="Path to pre-trained .pt file")
+    parser.add_argument('--results_folder', type=str, default='./results_smeme')
     
-    # S-MEME Parameters
-    parser.add_argument('--smeme_step_size', type=float, default=0.1, help="Entropy maximization strength (lambda). 0.1 is standard.")
-    parser.add_argument('--train_num_steps', type=int, default=10000, help="Number of fine-tuning steps")
+    # S-MEME Hyperparameters
+    parser.add_argument('--iterations', type=int, default=3, help="Number of S-MEME outer loops")
+    parser.add_argument('--alphas', nargs='+', type=float, default=[1.0, 0.5, 0.1], help="Regularization schedule")
+    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--steps_per_iter', type=int, default=1000, help="Gradient steps per S-MEME iteration")
     
-    # Standard Config
+    # Configs for Model
     parser.add_argument('--gin_config_files', nargs='*', type=str, default=['config/resmlp_denoiser.gin'])
     parser.add_argument('--gin_params', nargs='*', type=str, default=[])
-    parser.add_argument('--wandb-project', type=str, default="smeme-finetuning")
     parser.add_argument('--seed', type=int, default=0)
     
     args = parser.parse_args()
 
-    # 1. Parse Config
-    # We must append the pre-trained checkpoint config to ensure architecture match
-    # However, usually we just use the same .gin file.
+    # 1. Setup
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
-
-    # 2. Set Seeds
-    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
-
-    # 3. Load Data (Required for Manifold Support)
-    # We need to reconstruct the dataset to fine-tune on the valid manifold
-    from just_d4rl import d4rl_offline_dataset
-    print(f"Loading dataset {args.dataset}...")
-    d4rl_dataset = d4rl_offline_dataset(args.dataset)
+    np.random.seed(args.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    obs = d4rl_dataset['observations']
-    act = d4rl_dataset['actions']
-    next_obs = d4rl_dataset['next_observations']
-    rew = d4rl_dataset['rewards']
-    terminals = d4rl_dataset['terminals']
-
-    if len(rew.shape) == 1: rew = rew[:, None]
-    if len(terminals.shape) == 1: terminals = terminals[:, None]
-
-    # Concatenate to (s, a, r, s', t)
-    inputs_np = np.concatenate([obs, act, rew, next_obs, terminals], axis=1)
-    inputs = torch.from_numpy(inputs_np).float()
-    dataset = torch.utils.data.TensorDataset(inputs)
-
-    # 4. Construct Models
-    print("Constructing models...")
-    
-    # A. Trainable Model
-    model = construct_diffusion_model(inputs=inputs)
-    
-    # B. Reference Model (Identical Architecture)
-    ref_model = construct_diffusion_model(inputs=inputs)
-
-    # 5. Load Weights
-    print(f"Loading weights from {args.load_checkpoint}...")
-    checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
-    
-    # Handle state_dict structure
-    state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-    
-    model.load_state_dict(state_dict)
-    ref_model.load_state_dict(state_dict)
-    
-    # 6. Initialize S-MEME Trainer
     results_folder = pathlib.Path(args.results_folder)
     results_folder.mkdir(parents=True, exist_ok=True)
-    
-    # Save config for reproducibility
-    with open(results_folder / 'config.gin', 'w') as f:
-        f.write(gin.config_str())
 
-    trainer = SMEMETrainer(
-        diffusion_model=model,
-        ref_model=ref_model,
-        dataset=dataset,
-        results_folder=args.results_folder,
-        train_num_steps=args.train_num_steps,
-        smeme_step_size=args.smeme_step_size,
-        # Default params from gin or defaults
+    # 2. Data Loading (For shape and normalization context)
+    # Even though S-MEME generates data from noise, we need the dataset 
+    # to construct the model architecture correctly (dim size) and normalization stats.
+    print(f"Loading dataset info for {args.dataset}...")
+    d4rl_dataset = d4rl_offline_dataset(args.dataset)
+    obs = d4rl_dataset['observations']
+    act = d4rl_dataset['actions']
+    rew = d4rl_dataset['rewards'][:, None] if len(d4rl_dataset['rewards'].shape) == 1 else d4rl_dataset['rewards']
+    term = d4rl_dataset['terminals'][:, None] if len(d4rl_dataset['terminals'].shape) == 1 else d4rl_dataset['terminals']
+    next_obs = d4rl_dataset['next_observations']
+    
+    # Concatenate to determine input dimension
+    inputs_np = np.concatenate([obs, act, rew, next_obs, term], axis=1)
+    # We don't necessarily need a TensorDataset for training if we generate noise on the fly,
+    # but the Solver expects a DataLoader-like structure for the inner loop.
+    
+    # Creates a dummy loader that just yields noise (or real data if we wanted support constraints)
+    # For Pure S-MEME, we just need the shape.
+    input_dim = inputs_np.shape[1]
+    print(f"Data Dimension: {input_dim}")
+
+    # 3. Model Construction & Loading
+    # Construct base model structure
+    dummy_inputs = torch.zeros(1, input_dim)
+    base_model_edm = construct_diffusion_model(inputs=dummy_inputs)
+    
+    print(f"Loading weights from {args.load_checkpoint}...")
+    checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
+    state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+    
+    # Load weights
+    base_model_edm.load_state_dict(state_dict)
+    base_model_edm.to(device)
+    base_model_edm.eval() # Freeze stats
+
+    # 4. Wrap the Model for Adjoint Matching
+    # This converts the EDM (Denoising) model into a DDPM (Epsilon) interface
+    # compatible with our solver.
+    
+    am_config = AdjointMatchingConfig()
+    wrapped_model = DiffusionModelAdapter(base_model_edm, am_config).to(device)
+    
+    # 5. Configure S-MEME
+    smeme_config = SMEMEConfig(
+        num_smeme_iterations=args.iterations,
+        alpha_schedule=tuple(args.alphas),
+        am_config=am_config
     )
     
-    # Override the EMA model with the pre-trained weights as well
-    # (Trainer init creates a new EMA, so we must load it)
-    if 'ema' in checkpoint:
-        print("Loading EMA weights...")
-        trainer.ema.load_state_dict(checkpoint['ema'])
-    else:
-        print("Warning: No EMA weights found in checkpoint. EMA started from scratch (or matched model).")
-
-    # 7. Start Fine-Tuning
-    wandb.init(project=args.wandb_project, config=args)
-    trainer.train()
+    # 6. Initialize Solver
+    # SMEMESolver expects the wrapped model (epsilon predictor)
+    solver = SMEMESolver(base_model=wrapped_model, config=smeme_config)
+    
+    # 7. Training Loop
+    # We construct a generator that yields random noise batches
+    def noise_generator(batch_size, dim):
+        while True:
+            yield torch.randn(batch_size, dim).to(device)
+            
+    # We essentially manually run the solver's internal loop control
+    # relying on the SMEMESolver structure provided previously.
+    
+    # HACK: The SMEMESolver.train expects a loader. 
+    # We create a finite iterator for the number of steps requested.
+    class InfiniteNoiseLoader:
+        def __init__(self, batch_size, dim, limit):
+            self.batch_size = batch_size
+            self.dim = dim
+            self.limit = limit
+            self.cnt = 0
+        def __iter__(self):
+            return self
+        def __next__(self):
+            if self.cnt >= self.limit:
+                raise StopIteration
+            self.cnt += 1
+            return torch.randn(self.batch_size, self.dim).to(device)
+            
+    train_loader = InfiniteNoiseLoader(args.batch_size, input_dim, args.steps_per_iter)
+    
+    print("Starting S-MEME Training...")
+    
+    # Run S-MEME
+    # This returns the fine-tuned Wrapped Model
+    finetuned_wrapper = solver.train(train_loader)
+    
+    # 8. Save Results
+    # We need to extract the underlying EDM model state dict to stay compatible with Synther
+    finetuned_edm = finetuned_wrapper.current_model.model # Unwrap Adapter -> ElucidatedDiffusion
+    
+    save_path = results_folder / "smeme_finetuned.pt"
+    torch.save({
+        'model': finetuned_edm.state_dict(),
+        'config': smeme_config, 
+        'steps': args.steps_per_iter * args.iterations
+    }, save_path)
+    
+    print(f"Model saved to {save_path}")
