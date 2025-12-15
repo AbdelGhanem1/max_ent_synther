@@ -3,59 +3,44 @@ import copy
 import numpy as np
 from tqdm import tqdm
 import wandb
-from adjoint_matching_solver import AdjointMatchingSolver
+from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
 
 class SMEMESolver:
     def __init__(self, base_model, config):
         """
         Implements S-MEME (Algorithm 1) using Adjoint Matching as the linear solver.
-        
-        Args:
-            base_model: The pre-trained diffusion model (noise predictor).
-            config: Configuration object containing:
-                - num_smeme_iterations (K): e.g., 3 or 4
-                - alpha_schedule: list of regularization strengths [alpha_1, ..., alpha_K]
-                - am_config: Configuration for the inner AdjointMatchingSolver
         """
         self.current_model = base_model
         self.config = config
         
-        # We need a deep copy of the starting point to serve as the "previous" model
-        # in the first iteration.
         self.previous_model = copy.deepcopy(base_model)
         self.previous_model.eval()
         self.previous_model.requires_grad_(False)
 
     def _get_score_at_data(self, model, x_data, t_idx):
         """
-        Computes the Score Function s(x, t) at the data level.
-        Equation: s(x, t) = -epsilon(x, t) / sqrt(1 - alpha_bar_t)
+        Computes a STABLE Score Proxy s(x, t).
+        
+        Original Math: s(x, t) = -epsilon / sigma(t)
+        Problem: At t=0, sigma(t) -> 0, causing explosion.
+        
+        Fix: We return -epsilon.
+        This preserves the DIRECTION (pushing away from peaks) 
+        but removes the infinite MAGNITUDE.
         """
         t_tensor = torch.tensor([t_idx], device=x_data.device).repeat(x_data.shape[0])
         
         with torch.no_grad():
-            # 1. Predict Noise
+            # Predict Noise (Epsilon)
             eps = model(x_data, t_tensor)
             
-            # 2. Get Scaling Factor (1 / sqrt(1 - alpha_bar))
-            # Replicating scheduler logic for alpha_bar
-            num_train_timesteps = self.config.am_config.num_train_timesteps
-            betas = torch.linspace(0.0001, 0.02, num_train_timesteps, device=x_data.device)
-            alphas = 1.0 - betas
-            alphas_cumprod = torch.cumprod(alphas, dim=0)
-            
-            alpha_bar = alphas_cumprod[t_idx]
-            
-            # Score = -eps / sqrt(1 - alpha_bar)
-            # Add epsilon to denominator for stability
-            score = -eps / torch.sqrt(1 - alpha_bar + 1e-6)
+            # STABLE FIX: Do not divide by sigma!
+            # Just return -eps.
+            score = -eps 
             
         return score
 
     def train(self, train_loader):
-        """
-        Main S-MEME Loop (Algorithm 1)
-        """
         print(f"Starting S-MEME with K={self.config.num_smeme_iterations} iterations.")
         
         total_steps = 0
@@ -63,55 +48,63 @@ class SMEMESolver:
         for k in range(self.config.num_smeme_iterations):
             print(f"\n=== S-MEME Iteration {k+1}/{self.config.num_smeme_iterations} ===")
             
-            # 1. Setup the Linear Solver for this iteration
             alpha = self.config.alpha_schedule[k]
             self.config.am_config.reward_multiplier = 1.0 / alpha
             
             print(f"   > Alpha: {alpha} (Reward Multiplier: {self.config.am_config.reward_multiplier:.2f})")
             
             solver = VectorFieldAdjointSolver(
-                model_pre=self.previous_model, # Regularization target (Previous model)
-                model_fine=self.current_model, # Model being updated
+                model_pre=self.previous_model,
+                model_fine=self.current_model,
                 config=self.config.am_config
             )
             
             # 2. Define the "Reward Gradient" function
             def entropy_gradient_fn(x, t_idx):
-                # Return -Score (Gradient Ascent direction for Entropy)
+                # We want to Maximize Entropy => Move DOWNHILL (Away from peaks).
+                # Direction = Negative Score.
+                # Solver Formula: a = -multiplier * input_vector
+                # We want Force = -multiplier * ( -Score ) = +multiplier * Score?
+                # WAIT.
+                # Entropy Gradient is -Score.
+                # We want to move in direction of Entropy Gradient.
+                # So we want Force ~ -Score.
+                # Solver applies (-1). So we pass (+Score).
+                
+                # However, our _get_score now returns (-eps).
+                # (-eps) points UPHILL (towards data).
+                # We want to push particles APART (Downhill).
+                # So we want the OPPOSITE of (-eps). We want (+eps).
+                
+                # Let's trace carefully:
+                # 1. _get_score returns (-eps). This is the Score vector (Uphill).
+                # 2. We return this Score vector.
+                # 3. Solver calculates: adjoint = - (1/alpha) * Score.
+                # 4. Resulting Force: Negative Score (Downhill).
+                
+                # CONCLUSION: Passing the Score (Uphill vector) is correct.
+                # The solver's internal negative sign flips it to Downhill (Entropy Increase).
+                
                 score = self._get_score_at_data(self.previous_model, x, t_idx)
                 return score 
             
-            # 3. Inner Loop with Progress Bar
-            # We iterate over the finite loader provided by train_smeme.py
-            
+            # 3. Inner Loop
             pbar = tqdm(train_loader, desc=f"Iter {k+1}", dynamic_ncols=True)
             running_loss = 0.0
             
             for step, batch in enumerate(pbar):
-                # batch is purely noise here
-                
-                # Zero grad
                 self.current_model.zero_grad()
                 
-                # Execute Solver
                 loss = solver.solve_vector_field(batch, entropy_gradient_fn)
                 
-                # Update Weights
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.current_model.parameters(), 1.0)
                 
-                # Assuming standard optimizer stepping is handled outside 
-                # OR we implement simple SGD/Adam here if not passed.
-                # Since we didn't pass an optimizer to this class, we MUST create one.
-                # Standard practice: create a new optimizer for each S-MEME iteration 
-                # (or maintain one, but let's be safe).
                 if not hasattr(self, 'optimizer'):
-                    # Use standard AdamW defaults from paper
                     self.optimizer = torch.optim.AdamW(self.current_model.parameters(), lr=1e-4, weight_decay=1e-2)
                 
                 self.optimizer.step()
                 
-                # Logging
                 loss_val = loss.item()
                 running_loss = 0.9 * running_loss + 0.1 * loss_val if step > 0 else loss_val
                 
@@ -127,8 +120,6 @@ class SMEMESolver:
                 
                 total_steps += 1
                 
-            # 4. Update "Previous Model"
-            # Freeze current state as reference for next iteration
             self.previous_model.load_state_dict(self.current_model.state_dict())
             self.previous_model.eval()
             self.previous_model.requires_grad_(False)
@@ -145,8 +136,6 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
     def solve_vector_field(self, x_0, vector_field_fn, prompt_emb=None):
         """
         Modified solve method for S-MEME.
-        Args:
-            vector_field_fn: Function(x, t_idx) -> Tensor (Gradient Vector)
         """
         device = x_0.device
         batch_size = x_0.shape[0]
@@ -156,7 +145,7 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             device=device, dtype=torch.long
         )
         
-        # 1. Forward Pass (Same as parent)
+        # 1. Forward Pass
         traj = [x_0]
         curr_x = x_0
         with torch.no_grad():
@@ -182,14 +171,12 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
                 num_inference_steps=self.config.num_inference_steps
             )
             
-            # --- DIFFERENCE IS HERE ---
-            # Get the gradient vector (Negative Score) directly
-            reward_grad = vector_field_fn(x_final_clean, t_last)
+            # Use strict t_idx=0 for score evaluation to be consistent
+            reward_grad = vector_field_fn(x_final_clean, 0)
             
-        # Continue with standard logic
         adjoint_state = -self.config.reward_multiplier * reward_grad
         
-        # 3. Backward Pass (Same as parent)
+        # 3. Backward Pass
         adjoint_storage = {}
         for k in range(self.config.num_inference_steps - 1, -1, -1):
             t_val = timesteps[k].item()
@@ -198,7 +185,7 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             adjoint_state = adjoint_state + vjp
             adjoint_storage[k] = adjoint_state
             
-        # 4. Loss Computation (Same as parent)
+        # 4. Loss Computation
         active_indices = self._sample_time_indices(
             self.config.num_inference_steps, 
             self.config.num_timesteps_to_load, 
