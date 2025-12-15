@@ -183,18 +183,23 @@ if __name__ == '__main__':
             yield torch.randn(args.batch_size, input_dim).to(device)
             
     # Simple iterator wrapper
-    class InfiniteNoiseLoader:
-        def __init__(self, generator, limit):
-            self.gen = generator
-            self.limit = limit
-            self.cnt = 0
-        def __iter__(self):
-            return self
-        def __next__(self):
-            if self.cnt >= self.limit:
-                raise StopIteration
-            self.cnt += 1
-            return next(self.gen)
+    # Simple iterator wrapper
+        class InfiniteNoiseLoader:
+            def __init__(self, generator, limit):
+                self.gen = generator
+                self.limit = limit
+                self.cnt = 0
+                
+            def __iter__(self):
+                # FIX: Reset counter when a new loop starts
+                self.cnt = 0
+                return self
+                
+            def __next__(self):
+                if self.cnt >= self.limit:
+                    raise StopIteration
+                self.cnt += 1
+                return next(self.gen)
             
     train_loader = InfiniteNoiseLoader(noise_generator(), args.steps_per_iter)
     
@@ -205,7 +210,8 @@ if __name__ == '__main__':
     finetuned_wrapper = solver.train(train_loader)
     
     # 8. Save Results
-    finetuned_edm = finetuned_wrapper.current_model.model 
+    # FIX: The wrapper IS the model interface. The underlying EDM is in .model
+    finetuned_edm = finetuned_wrapper.model 
     
     save_path = results_folder / "smeme_finetuned.pt"
     torch.save({
