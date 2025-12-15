@@ -4,7 +4,7 @@ import argparse
 import torch
 import numpy as np
 import gymnasium as gym  # Using gymnasium instead of gym
-# REMOVED: import d4rl 
+import gin  # <--- Added missing import
 from tqdm import tqdm
 from scipy.spatial.distance import cdist
 import copy
