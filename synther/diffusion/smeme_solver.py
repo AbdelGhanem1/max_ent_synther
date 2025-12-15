@@ -5,7 +5,7 @@ from tqdm import tqdm
 import wandb
 from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
 
-# FIX: Use new PyTorch 2.x AMP imports to avoid warnings
+# Use torch.amp for PyTorch 2.x compatibility
 from torch.amp import autocast, GradScaler 
 
 class SMEMESolver:
@@ -16,13 +16,15 @@ class SMEMESolver:
         self.current_model = base_model
         self.config = config
         
+        # FIX 1: Explicitly force the current model to be trainable
+        self.current_model.train()
+        for p in self.current_model.parameters():
+            p.requires_grad = True
+        
         # Create the reference model (Previous Iteration)
         self.previous_model = copy.deepcopy(base_model)
         self.previous_model.eval()
         self.previous_model.requires_grad_(False)
-        
-        # NOTE: Removed torch.compile as it was breaking the gradient graph.
-        # AMP (autocast) below provides the majority of the speedup safely.
 
     def _get_score_at_data(self, model, x_data, t_idx):
         """
@@ -32,7 +34,6 @@ class SMEMESolver:
         t_tensor = torch.tensor([t_idx], device=x_data.device).repeat(x_data.shape[0])
         
         with torch.no_grad():
-            # Use 'cuda' device type for autocast
             with autocast(device_type='cuda'): 
                 eps = model(x_data, t_tensor)
                 score = -eps 
@@ -50,6 +51,10 @@ class SMEMESolver:
         for k in range(self.config.num_smeme_iterations):
             print(f"\n=== S-MEME Iteration {k+1}/{self.config.num_smeme_iterations} ===")
             
+            # Ensure model is in training mode for this iteration
+            self.current_model.train()
+            self.current_model.requires_grad_(True)
+            
             alpha = self.config.alpha_schedule[k]
             self.config.am_config.reward_multiplier = 1.0 / alpha
             
@@ -62,7 +67,6 @@ class SMEMESolver:
             )
             
             def entropy_gradient_fn(x, t_idx):
-                # Returns Positive Score (because Solver applies negative sign)
                 score = self._get_score_at_data(self.previous_model, x, t_idx)
                 return score 
             
@@ -76,22 +80,31 @@ class SMEMESolver:
                 with autocast(device_type='cuda'):
                     loss = solver.solve_vector_field(batch, entropy_gradient_fn)
                 
-                # --- Check for NaN ---
+                # --- FIX 3: Robust Gradient Check ---
                 if torch.isnan(loss):
-                    print(f"⚠️ Warning: Loss is NaN at step {step}. Skipping update.")
+                    # Warning for numerical explosion
+                    # Only print occasionally to avoid spamming
+                    if step % 10 == 0:
+                        print(f"⚠️ Warning: Loss is NaN at step {step}. Skipping.")
+                    continue
+
+                if loss.grad_fn is None:
+                    # Warning for broken graph (prevents crash)
+                    # This usually implies active_indices was empty or model was frozen
+                    if step % 100 == 0: 
+                        print(f"⚠️ Warning: Loss has no gradient at step {step}. Skipping.")
                     continue
                 
                 # --- OPTIMIZATION: Scaled Backward Pass ---
                 scaler.scale(loss).backward()
                 
-                # Unscale before clipping
+                # Create optimizer if not exists
                 if not hasattr(self, 'optimizer'):
                     self.optimizer = torch.optim.AdamW(self.current_model.parameters(), lr=1e-4, weight_decay=1e-2)
                 
                 scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.current_model.parameters(), 1.0)
                 
-                # Step with scaler
                 scaler.step(self.optimizer)
                 scaler.update()
                 
@@ -181,8 +194,14 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             self.config.num_timesteps_to_load, 
             device
         )
-        total_loss = torch.tensor(0.0, device=device) # Ensure it's a tensor
         
+        # FIX 2: Initialize as Python float to accept gradients naturally
+        total_loss = 0.0 
+        
+        # Debug check for empty indices (should not happen with default configs)
+        if len(active_indices) == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
         for k in active_indices:
             k = k.item()
             t_val = timesteps[k].item()
