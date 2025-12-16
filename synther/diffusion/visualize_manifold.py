@@ -57,15 +57,40 @@ def load_models_and_data(args, device):
     return base_model, smeme_model, real_data, obs_dim
 
 def generate_samples(model, num_samples, batch_size=512):
-    """Generates pure observation samples from the model."""
+    """
+    Generates pure observation samples from the model.
+    Dynamically fetches step count from Gin config to match training/eval.
+    """
     model.eval()
     samples_list = []
     num_batches = int(np.ceil(num_samples / batch_size))
     
-    print(f"Generating {num_samples} samples...")
+    # --- DYNAMIC CONFIG CHECK ---
+    # We attempt to find the correct step count from the loaded Gin config.
+    # This prevents the "Vis=64 vs Eval=1000" mismatch.
+    try:
+        # 1. Try to get it from the solver config directly if possible
+        if hasattr(model, 'solver') and hasattr(model.solver, 'num_inference_steps'):
+             n_steps = model.solver.num_inference_steps
+        # 2. Fallback to querying Gin explicitly
+        else:
+             n_steps = gin.query_parameter('AdjointMatchingConfig.num_inference_steps')
+             
+        # 3. Handle Gin returning macro strings or None
+        if n_steps is None or isinstance(n_steps, str):
+            print("⚠️ Warning: Could not resolve steps from Gin/Model. Defaulting to 1000.")
+            n_steps = 1000
+            
+    except Exception as e:
+        print(f"⚠️ Error reading config for steps ({e}). Defaulting to 1000.")
+        n_steps = 1000
+
+    print(f"Generating {num_samples} samples using {n_steps} steps...")
+    
     with torch.no_grad():
         for _ in tqdm(range(num_batches)):
-            batch_samples = model.sample(batch_size=batch_size, num_sample_steps=64) # Faster sampling
+            # Pass the dynamic n_steps variable
+            batch_samples = model.sample(batch_size=batch_size, num_sample_steps=n_steps)
             samples_list.append(batch_samples.cpu().numpy())
             
     # Crop and extract ONLY Observations (indices 0 to obs_dim)
