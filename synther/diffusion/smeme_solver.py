@@ -39,7 +39,7 @@ class SMEMESolver:
             
             # Score = -eps / sqrt(1 - alpha_bar)
             # Add epsilon to denominator for stability
-            score = -eps / torch.sqrt(1 - alpha_bar + 1e-6)
+            score = -eps #/ torch.sqrt(1 - alpha_bar + 1e-6)
             
         return score
 
