@@ -27,17 +27,37 @@ class SMEMESolver:
         self.previous_model.requires_grad_(False)
 
     def _get_score_at_data(self, model, x_data, t_idx):
-        """
-        Computes a STABLE Score Proxy s(x, t).
-        Returns -epsilon (Stable Direction).
-        """
-        t_tensor = torch.tensor([t_idx], device=x_data.device).repeat(x_data.shape[0])
-        
-        with torch.no_grad():
-            with autocast(device_type='cuda'): 
-                eps = model(x_data, t_tensor)
-                score = -eps 
+            """
+            Computes the TRUE Score s(x, t) = -epsilon / sigma.
+            Now includes the critical 1/sigma scaling to prevent vanishing gradients.
+            """
+            # Create timestep tensor [Batch,]
+            t_tensor = torch.tensor([t_idx], device=x_data.device).repeat(x_data.shape[0])
             
+            with torch.no_grad():
+                with autocast(device_type='cuda'):
+                    # 1. Get Noise Prediction (Epsilon)
+                    eps = model(x_data, t_tensor)
+                    
+                    # 2. Get Sigma (Noise Level) from the Adapter
+                    # The model passed here is DiffusionModelAdapter, so it has this method.
+                    if hasattr(model, 'get_sigma_at_step'):
+                        sigma = model.get_sigma_at_step(t_tensor)
+                    else:
+                        # Fallback if unwrapped (unlikely given your train script)
+                        # Assume t_idx maps linearly 0->1 if we can't ask the model
+                        sigma = torch.tensor(1.0, device=x_data.device) 
+                        print("⚠️ Warning: Model has no get_sigma_at_step. Using sigma=1.0")
+
+                    # 3. Reshape for broadcasting [Batch, 1]
+                    sigma = sigma.view(-1, 1)
+                    
+                    # 4. Compute Raw Score (The Nuclear Option)
+                    # We add a tiny clamp (1e-5) just to prevent literal NaN division
+                    # but allow it to get MASSIVE (e.g., 10,000).
+                    safe_sigma = torch.maximum(sigma, torch.tensor(1e-5, device=x_data.device))
+                    score = -eps / safe_sigma 
+                
         return score
 
     def train(self, train_loader):
