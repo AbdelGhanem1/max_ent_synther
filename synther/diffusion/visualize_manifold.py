@@ -166,7 +166,7 @@ def run_visualization(args):
     plt.legend(markerscale=3.0)
     plt.tight_layout()
     
-    save_path = "results_smeme/manifold_umap.png"
+    save_path = "results_smeme_fast/manifold_umap.png"
     plt.savefig(save_path)
     print(f"\n✅ Visualization saved to {save_path}")
     plt.show()
