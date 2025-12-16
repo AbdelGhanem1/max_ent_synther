@@ -96,7 +96,7 @@ class SMEMESolver:
                 # The solver's internal negative sign flips it to Downhill (Entropy Increase).
                 
                 score = self._get_score_at_data(self.previous_model, x, t_idx)
-                return -score 
+                return score 
             
             # 3. Inner Loop
             pbar = tqdm(train_loader, desc=f"Iter {k+1}", dynamic_ncols=True)
