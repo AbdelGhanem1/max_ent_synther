@@ -19,27 +19,34 @@ class SMEMESolver:
 
     def _get_score_at_data(self, model, x_data, t_idx):
         """
-        Computes the Score Function s(x, t) at the data level.
-        Equation: s(x, t) = -epsilon(x, t) / sqrt(1 - alpha_bar_t)
+        Computes the Score using the CORRECT EDM Physics.
+        Score = -epsilon / sigma
         """
+        # 1. Create Time Tensor
         t_tensor = torch.tensor([t_idx], device=x_data.device).repeat(x_data.shape[0])
         
         with torch.no_grad():
-            # 1. Predict Noise
-            eps = model(x_data, t_tensor)
-            
-            # 2. Get Scaling Factor (1 / sqrt(1 - alpha_bar))
-            # Replicating scheduler logic for alpha_bar
-            num_train_timesteps = self.config.am_config.num_train_timesteps
-            betas = torch.linspace(0.0001, 0.02, num_train_timesteps, device=x_data.device)
-            alphas = 1.0 - betas
-            alphas_cumprod = torch.cumprod(alphas, dim=0)
-            
-            alpha_bar = alphas_cumprod[t_idx]
-            
-            # Score = -eps / sqrt(1 - alpha_bar)
-            # Add epsilon to denominator for stability
-            score = -eps #/ torch.sqrt(1 - alpha_bar + 1e-6)
+            with autocast(device_type='cuda'):
+                # 2. Get Epsilon (Noise Prediction)
+                eps = model(x_data, t_tensor)
+                
+                # 3. GET THE CORRECT SIGMA
+                # We ask the adapter what sigma corresponds to this t_idx.
+                # This ensures we use the exact schedule the model was trained on.
+                if hasattr(model, 'get_sigma_at_step'):
+                    sigma = model.get_sigma_at_step(t_tensor)
+                else:
+                    # Fallback (Should not happen with your setup)
+                    sigma = torch.tensor(1.0, device=x_data.device)
+
+                # Reshape for broadcasting
+                sigma = sigma.view(-1, 1)
+                
+                # 4. Compute Score with Safety Clamp
+                # We limit sigma to >= 0.05 to prevent the "Infinite Force" explosion.
+                # This allows you to train fast (low steps) without crashing.
+                safe_sigma = torch.maximum(sigma, torch.tensor(0.05, device=x_data.device))
+                score = -eps / safe_sigma
             
         return score
 
