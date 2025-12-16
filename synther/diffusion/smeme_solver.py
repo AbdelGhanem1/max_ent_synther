@@ -19,24 +19,27 @@ class SMEMESolver:
 
     def _get_score_at_data(self, model, x_data, t_idx):
         """
-        Computes a STABLE Score Proxy s(x, t).
-        
-        Original Math: s(x, t) = -epsilon / sigma(t)
-        Problem: At t=0, sigma(t) -> 0, causing explosion.
-        
-        Fix: We return -epsilon.
-        This preserves the DIRECTION (pushing away from peaks) 
-        but removes the infinite MAGNITUDE.
+        Computes the Score Function s(x, t) at the data level.
+        Equation: s(x, t) = -epsilon(x, t) / sqrt(1 - alpha_bar_t)
         """
         t_tensor = torch.tensor([t_idx], device=x_data.device).repeat(x_data.shape[0])
         
         with torch.no_grad():
-            # Predict Noise (Epsilon)
+            # 1. Predict Noise
             eps = model(x_data, t_tensor)
             
-            # STABLE FIX: Do not divide by sigma!
-            # Just return -eps.
-            score = -eps 
+            # 2. Get Scaling Factor (1 / sqrt(1 - alpha_bar))
+            # Replicating scheduler logic for alpha_bar
+            num_train_timesteps = self.config.am_config.num_train_timesteps
+            betas = torch.linspace(0.0001, 0.02, num_train_timesteps, device=x_data.device)
+            alphas = 1.0 - betas
+            alphas_cumprod = torch.cumprod(alphas, dim=0)
+            
+            alpha_bar = alphas_cumprod[t_idx]
+            
+            # Score = -eps / sqrt(1 - alpha_bar)
+            # Add epsilon to denominator for stability
+            score = -eps / torch.sqrt(1 - alpha_bar + 1e-6)
             
         return score
 
