@@ -9,7 +9,7 @@ from torch.amp import autocast, GradScaler
 class SMEMESolver:
     def __init__(self, base_model, config):
         """
-        Implements S-MEME (Algorithm 1) using Adjoint Matching as the linear solver.
+        Implements S-MEME with AMP (Mixed Precision) and Robust Gradient Checks.
         """
         self.current_model = base_model
         self.config = config
@@ -25,6 +25,8 @@ class SMEMESolver:
         """
         Computes the Score Function s(x, t) at the data level.
         Equation: s(x, t) = -epsilon(x, t) / sqrt(1 - alpha_bar_t)
+        
+        PRESERVED EXACT LOGIC FROM YOUR OLD CODE.
         """
         t_tensor = torch.tensor([t_idx], device=x_data.device).repeat(x_data.shape[0])
         
@@ -75,32 +77,46 @@ class SMEMESolver:
             for step, batch in enumerate(pbar):
                 self.current_model.zero_grad()
                 
-                # Autocast Forward
+                # 1. Autocast Forward
                 with autocast(device_type='cuda'):
                     loss = solver.solve_vector_field(batch, entropy_gradient_fn)
                 
-                # Check if loss has grad_fn to prevent crash
-                if loss.grad_fn is None:
-                     # This happens if active_indices was empty. We skip the step.
-                     continue
+                # --- FIX: ROBUST LOSS CHECK ---
+                # If loss is 0.0 (float) or has no graph, it means the solver did nothing.
+                if isinstance(loss, float) or loss.grad_fn is None:
+                    continue
 
-                # Scaled Backward
+                # 2. Scaled Backward
                 self.scaler.scale(loss).backward()
                 
+                # Initialize optimizer if needed
                 if not hasattr(self, 'optimizer'):
                     self.optimizer = torch.optim.AdamW(self.current_model.parameters(), lr=1e-4, weight_decay=1e-2)
                 
-                # Unscale & Clip
+                # 3. Unscale Weights
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.current_model.parameters(), 1.0)
                 
-                # Step
+                # --- FIX: ROBUST GRADIENT CHECK ---
+                # We check if ANY parameter actually received a gradient.
+                # If not, 'scaler.step' would crash with the AssertionError.
+                grads_exist = False
+                for p in self.current_model.parameters():
+                    if p.grad is not None:
+                        grads_exist = True
+                        break
+                
+                if not grads_exist:
+                    # Skip step if no gradients reached the model
+                    continue
+
+                # 4. Clip & Step
+                torch.nn.utils.clip_grad_norm_(self.current_model.parameters(), 1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
+                # Logging
                 loss_val = loss.item()
                 running_loss = 0.9 * running_loss + 0.1 * loss_val if step > 0 else loss_val
-                
                 pbar.set_postfix({'loss': f"{running_loss:.4f}"})
                 
                 if wandb.run is not None:
@@ -179,9 +195,8 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             device
         )
         
-        # --- FIX: Initialize as Tensor with Gradient ---
-        # This prevents the "float has no grad_fn" error if active_indices is empty
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        # Initialize as float (to detect if no updates occur)
+        total_loss = 0.0
         
         for k in active_indices:
             k = k.item()
