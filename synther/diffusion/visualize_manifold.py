@@ -79,11 +79,11 @@ def generate_samples(model, num_samples, batch_size=512):
         # 3. Handle Gin returning macro strings or None
         if n_steps is None or isinstance(n_steps, str):
             print("⚠️ Warning: Could not resolve steps from Gin/Model. Defaulting to 60.")
-            n_steps = 60
+            n_steps = 500
             
     except Exception as e:
         print(f"⚠️ Error reading config for steps ({e}). Defaulting to 1000.")
-        n_steps = 60
+        n_steps = 500
 
     print(f"Generating {num_samples} samples using {n_steps} steps...")
     
