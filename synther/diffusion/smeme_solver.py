@@ -4,7 +4,7 @@ import numpy as np
 from tqdm import tqdm
 import wandb
 from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
-
+from torch.amp import autocast, GradScaler
 class SMEMESolver:
     def __init__(self, base_model, config):
         """
