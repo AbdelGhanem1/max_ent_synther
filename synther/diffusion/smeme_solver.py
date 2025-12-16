@@ -4,8 +4,6 @@ import numpy as np
 from tqdm import tqdm
 import wandb
 from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
-
-# 1. AMP IMPORTS
 from torch.amp import autocast, GradScaler
 
 class SMEMESolver:
@@ -20,25 +18,20 @@ class SMEMESolver:
         self.previous_model.eval()
         self.previous_model.requires_grad_(False)
         
-        # 2. INITIALIZE SCALER
+        # Initialize Scaler for AMP
         self.scaler = GradScaler('cuda')
 
     def _get_score_at_data(self, model, x_data, t_idx):
         """
         Computes the Score Function s(x, t) at the data level.
         Equation: s(x, t) = -epsilon(x, t) / sqrt(1 - alpha_bar_t)
-        
-        PRESERVED EXACT LOGIC FROM YOUR OLD CODE.
         """
         t_tensor = torch.tensor([t_idx], device=x_data.device).repeat(x_data.shape[0])
         
         with torch.no_grad():
-            # 3. AUTOCAST FOR INFERENCE SPEEDUP
             with autocast(device_type='cuda'):
-                # 1. Predict Noise
                 eps = model(x_data, t_tensor)
             
-            # 2. Get Scaling Factor (1 / sqrt(1 - alpha_bar))
             # Replicating scheduler logic for alpha_bar
             num_train_timesteps = self.config.am_config.num_train_timesteps
             betas = torch.linspace(0.0001, 0.02, num_train_timesteps, device=x_data.device)
@@ -72,36 +65,36 @@ class SMEMESolver:
                 config=self.config.am_config
             )
             
-            # 2. Define the "Reward Gradient" function
             def entropy_gradient_fn(x, t_idx):
-                # PRESERVED LOGIC: This calls your _get_score_at_data above
                 score = self._get_score_at_data(self.previous_model, x, t_idx)
                 return score 
             
-            # 3. Inner Loop
             pbar = tqdm(train_loader, desc=f"Iter {k+1}", dynamic_ncols=True)
             running_loss = 0.0
             
             for step, batch in enumerate(pbar):
                 self.current_model.zero_grad()
                 
-                # 4. AUTOCAST THE SOLVER (This speeds up the ODE integration)
+                # Autocast Forward
                 with autocast(device_type='cuda'):
                     loss = solver.solve_vector_field(batch, entropy_gradient_fn)
                 
-                # 5. SCALED BACKWARD PASS (Required for AMP)
+                # Check if loss has grad_fn to prevent crash
+                if loss.grad_fn is None:
+                     # This happens if active_indices was empty. We skip the step.
+                     continue
+
+                # Scaled Backward
                 self.scaler.scale(loss).backward()
                 
                 if not hasattr(self, 'optimizer'):
                     self.optimizer = torch.optim.AdamW(self.current_model.parameters(), lr=1e-4, weight_decay=1e-2)
                 
-                # Unscale before clipping
+                # Unscale & Clip
                 self.scaler.unscale_(self.optimizer)
-                
-                # Clip gradients (Logic preserved)
                 torch.nn.utils.clip_grad_norm_(self.current_model.parameters(), 1.0)
                 
-                # Step and Update Scaler
+                # Step
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
@@ -130,13 +123,9 @@ class SMEMESolver:
 class VectorFieldAdjointSolver(AdjointMatchingSolver):
     """
     Subclass of AdjointMatchingSolver that overrides the initialization step.
-    NO CHANGES NEEDED HERE - Autocast in the training loop handles the internals.
     """
     
     def solve_vector_field(self, x_0, vector_field_fn, prompt_emb=None):
-        """
-        Modified solve method for S-MEME.
-        """
         device = x_0.device
         batch_size = x_0.shape[0]
         timesteps = torch.linspace(
@@ -159,7 +148,7 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
                 traj.append(prev_x)
                 curr_x = prev_x
 
-        # 2. Adjoint Initialization (OVERRIDDEN)
+        # 2. Adjoint Initialization
         x_prev = traj[-2]
         t_last = timesteps[-1].item()
         
@@ -170,8 +159,6 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
                 noise_pred, t_last, x_prev, eta=0.0,
                 num_inference_steps=self.config.num_inference_steps
             )
-            
-            # Use strict t_idx=0 for score evaluation to be consistent
             reward_grad = vector_field_fn(x_final_clean, 0)
             
         adjoint_state = -self.config.reward_multiplier * reward_grad
@@ -191,7 +178,11 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             self.config.num_timesteps_to_load, 
             device
         )
-        total_loss = 0.0
+        
+        # --- FIX: Initialize as Tensor with Gradient ---
+        # This prevents the "float has no grad_fn" error if active_indices is empty
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
         for k in active_indices:
             k = k.item()
             t_val = timesteps[k].item()
@@ -216,6 +207,6 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             ema_threshold = self._ema_update(current_quantile)
             mask = (loss_root < ema_threshold).float()
             
-            total_loss += (loss_per_sample * mask).mean()
+            total_loss = total_loss + (loss_per_sample * mask).mean()
             
         return total_loss
