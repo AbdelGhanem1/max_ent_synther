@@ -79,6 +79,7 @@ def visualize(args):
     embedding = reducer.fit_transform(all_data)
     
     emb_real = embedding[:N_real]
+    emb_base = embedding[N:2*N] # Fixed indexing just in case N_real != N_gen
     emb_base = embedding[N_real : N_real+N_gen]
     emb_smeme = embedding[N_real+N_gen :]
 
@@ -94,17 +95,18 @@ def visualize(args):
     print("Generating 'manifold_composite_lines.pdf'...")
     fig1, ax1 = plt.subplots(1, 1, figsize=(10, 8))
     
-    # 1. Real Data: Dashed Grey Boundary (95% confidence)
-    # thresh=0.05 cuts off the lowest 5% density (outliers)
-    sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], levels=[0.05], color=c_real, 
+    # FIX: Use thresh + levels=1 instead of levels=[0.05]
+    
+    # 1. Real Data: Dashed Grey Boundary
+    sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], thresh=0.05, levels=1, color=c_real, 
                 linewidths=2.0, linestyles="--", ax=ax1, fill=False)
 
     # 2. Base Model: Solid Blue Boundary
-    sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], levels=[0.05], color=c_base, 
+    sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], thresh=0.05, levels=1, color=c_base, 
                 linewidths=3.0, ax=ax1, fill=False)
     
     # 3. S-MEME: Solid Orange Boundary
-    sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], levels=[0.05], color=c_smeme, 
+    sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], thresh=0.05, levels=1, color=c_smeme, 
                 linewidths=3.0, ax=ax1, fill=False)
 
     ax1.set_title(f"Manifold Boundaries (95% Confidence)", fontweight='bold', pad=20)
@@ -128,19 +130,18 @@ def visualize(args):
     print("Generating 'manifold_cores.pdf'...")
     fig2, ax2 = plt.subplots(1, 1, figsize=(10, 8))
     
-    # Plot only the top 50% density (the peaks)
-    # Using 'fill=True' here because they shouldn't overlap much if diversity increased
+    # FIX: Use thresh=0.5 (Top 50%) and levels=1 to create a single filled blob
     
-    # Real Data (Background Reference) - Very faint
-    sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], levels=[0.05], color=c_real, 
+    # Real Data (Background Reference)
+    sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], thresh=0.05, levels=1, color=c_real, 
                 fill=True, alpha=0.1, ax=ax2)
     
-    # Base Model Core (Blue)
-    sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], levels=[0.5], color=c_base, 
+    # Base Model Core (Blue) - Peaks only
+    sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], thresh=0.5, levels=1, color=c_base, 
                 fill=True, alpha=0.5, ax=ax2)
     
-    # S-MEME Core (Orange)
-    sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], levels=[0.5], color=c_smeme, 
+    # S-MEME Core (Orange) - Peaks only
+    sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], thresh=0.5, levels=1, color=c_smeme, 
                 fill=True, alpha=0.5, ax=ax2)
     
     ax2.set_title(f"High-Density Modes (Top 50%)", fontweight='bold', pad=20)
@@ -174,10 +175,7 @@ def visualize(args):
     plt.savefig("manifold_scatter.pdf", dpi=300)
     plt.close(fig3)
     
-    print("\n✅ DONE. Generated 3 plots:")
-    print("   1. manifold_composite_lines.pdf (Clean boundaries, Best for paper)")
-    print("   2. manifold_cores.pdf (Where the models focus mostly)")
-    print("   3. manifold_scatter.pdf (Raw particles)")
+    print("\n✅ DONE. Generated 3 plots.")
 
 if __name__ == "__main__":
     sys.modules['__main__'].SMEMEConfig = SMEMEConfig
