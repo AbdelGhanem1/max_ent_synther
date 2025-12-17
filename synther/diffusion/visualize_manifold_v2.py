@@ -1,4 +1,4 @@
-# synther/diffusion/visualize_manifold_v3.py
+# synther/diffusion/visualize_manifold_final.py
 
 import argparse
 import torch
@@ -16,7 +16,7 @@ from just_d4rl import d4rl_offline_dataset
 
 # Clean, professional styling
 sns.set_context("paper", font_scale=1.6)
-sns.set_style("white", {"axes.edgecolor": "0.15"}) # White background is cleaner for overlaps
+sns.set_style("white", {"axes.edgecolor": "0.15"}) 
 plt.rcParams.update({
     "font.family": "serif", 
     "text.usetex": False,
@@ -89,23 +89,20 @@ def visualize(args):
     c_smeme = colors[3] # Orange
     
     # ========================================================================
-    # GENERATE DENSITY PLOT (FILLED OVERLAP STYLE)
+    # FIGURE 1: CLEAN DENSITY PLOT
     # ========================================================================
-    print("Generating 'manifold_density_filled.pdf'...")
+    print("Generating 'manifold_density.pdf'...")
     fig, ax = plt.subplots(1, 1, figsize=(10, 8))
     
-    # A. Real Data: THIN OUTLINE ONLY (The Boundary)
-    # We do NOT fill this, so it doesn't muddy the colors. It acts as a fence.
+    # A. Real Data: THIN OUTLINE ONLY (Boundary)
     sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], levels=1, color=c_real, 
                 linewidths=1.5, ax=ax, thresh=0.05, linestyle="--")
     
     # B. Base Model: FILLED BLUE
-    # alpha=0.4 allows the background to show through slightly
     sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], levels=5, color=c_base, 
                 fill=True, alpha=0.4, ax=ax, thresh=0.1)
     
     # C. S-MEME: FILLED ORANGE
-    # alpha=0.4 on top of Blue creates a specific "Overlap Color"
     sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], levels=5, color=c_smeme, 
                 fill=True, alpha=0.4, ax=ax, thresh=0.1)
     
@@ -114,30 +111,39 @@ def visualize(args):
     ax.set_yticks([])
     sns.despine(left=True, bottom=True)
     
-    # Custom Legend interpreting the overlaps
+    # Clean Legend
     legend_elements = [
         Line2D([0], [0], color=c_real, lw=1.5, linestyle="--", label='Real Data Boundary'),
-        Patch(facecolor=c_base, alpha=0.4, label='Base Model (Conservative)'),
-        Patch(facecolor=c_smeme, alpha=0.4, label='S-MEME (Expansion)'),
-        # Manually creating a "Patch" that represents the overlap color (approx visual)
-        Patch(facecolor='purple', alpha=0.4, label='Overlap (Retained Knowledge)'),
+        Patch(facecolor=c_base, alpha=0.4, label='Base Model'),
+        Patch(facecolor=c_smeme, alpha=0.4, label='S-MEME (Ours)'),
     ]
     ax.legend(handles=legend_elements, loc='upper right', frameon=True, framealpha=0.95)
 
     plt.tight_layout()
-    plt.savefig("manifold_density_filled.pdf", dpi=300, bbox_inches='tight')
-    plt.savefig("manifold_density_filled.png", dpi=300, bbox_inches='tight')
-    print("✅ Saved to manifold_density_filled.pdf")
+    plt.savefig("manifold_density.pdf", dpi=300, bbox_inches='tight')
+    plt.savefig("manifold_density.png", dpi=300, bbox_inches='tight')
+    print("✅ Saved to manifold_density.pdf")
 
     # ========================================================================
-    # GENERATE SCATTER PLOT (Optional, for reference)
+    # FIGURE 2: SCATTER PLOT
     # ========================================================================
     print("Generating 'manifold_scatter.pdf'...")
     fig2, ax2 = plt.subplots(1, 1, figsize=(10, 8))
+    # Light texture background
     ax2.scatter(emb_real[:,0], emb_real[:,1], c=[c_real], s=2, alpha=0.05, label='Offline Data')
+    # Model particles
     ax2.scatter(emb_base[:,0], emb_base[:,1], c=[c_base], s=15, alpha=0.5, label='Base Model')
     ax2.scatter(emb_smeme[:,0], emb_smeme[:,1], c=[c_smeme], s=25, alpha=0.6, marker='x', label='S-MEME')
-    ax2.legend()
+    
+    # Simple Legend
+    leg2 = [
+        Line2D([0], [0], marker='o', color='w', label='Offline Data', markerfacecolor=c_real, markersize=10),
+        Line2D([0], [0], marker='o', color='w', label='Base Model', markerfacecolor=c_base, markersize=10),
+        Line2D([0], [0], marker='x', color=c_smeme, label='S-MEME', markersize=10, lw=2)
+    ]
+    ax2.legend(handles=leg2, loc='upper right')
+    
+    ax2.set_title(f"Particle Distribution: {args.dataset}", fontweight='bold', pad=15)
     ax2.set_xticks([])
     ax2.set_yticks([])
     sns.despine(left=True, bottom=True)
