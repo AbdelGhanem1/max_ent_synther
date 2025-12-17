@@ -173,6 +173,15 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             # [CRITICAL] Reward grad might be large, keep float32
             reward_grad = vector_field_fn(x_final_clean, 0).float()
             
+            # [STABILITY FIX] Normalize the reward gradient
+            # The raw score can be huge (100+). We normalize it to have a reasonable scale.
+            # This prevents the initial "kick" of the backward ODE from being Infinite.
+            grad_norm = torch.norm(reward_grad.reshape(reward_grad.shape[0], -1), dim=1, keepdim=True)
+            # Clip the norm to a max value (e.g., 1.0 or 10.0) to prevent explosion
+            # but allow small gradients to pass through.
+            scale_factor = torch.clamp(grad_norm, min=1.0) 
+            reward_grad = reward_grad / scale_factor
+            
         adjoint_state = -self.config.reward_multiplier * reward_grad
         
         # 3. Backward Pass
@@ -184,7 +193,7 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             adjoint_state = adjoint_state + vjp
             adjoint_storage[k] = adjoint_state
             
-        # 4. Loss Computation
+        # 4. Loss Computation (Float32 forced)
         active_indices = self._sample_time_indices(
             self.config.num_inference_steps, 
             self.config.num_timesteps_to_load, 
@@ -200,7 +209,7 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             
             t_tensor = torch.tensor([t_val], device=device).repeat(batch_size)
             
-            # We must allow gradients here
+            # Force Float32 for model output and loss
             eps_fine = self.model_fine(x_k, t_tensor, prompt_emb).float()
             
             with torch.no_grad():
@@ -212,10 +221,9 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             diff = (eps_fine - eps_pre)
             
             # [FIX] Force target calculation in float32
-            # target_adjoint can be large (~200+). std_dev_t is small.
             target = target_adjoint.float() * std_dev_t.view(-1, 1).float()
             
-            # This square is the danger zone for FP16
+            # Loss Calculation
             loss_per_sample = torch.sum((diff + target) ** 2, dim=1)
             
             # EMA Clipping (Ensure float32)
