@@ -8,6 +8,8 @@ import seaborn as sns
 import umap
 import gin
 import sys
+import random
+import os
 from matplotlib.lines import Line2D
 from synther.diffusion.utils import construct_diffusion_model
 from synther.diffusion.train_smeme import SMEMEConfig, AdjointMatchingConfig
@@ -30,6 +32,17 @@ plt.rcParams.update({
 def get_device():
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+def set_seed(seed):
+    """Sets the seed for reproducibility."""
+    print(f"Setting global seed to {seed}...")
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 def generate_obs_samples(model, num_samples, obs_dim, num_inference_steps):
     model.eval()
     samples = []
@@ -43,9 +56,11 @@ def generate_obs_samples(model, num_samples, obs_dim, num_inference_steps):
     return np.vstack(samples)[:num_samples]
 
 def visualize(args):
+    # 1. SET SEED
+    set_seed(args.seed)
     device = get_device()
     
-    # 1. LOAD DATA & MODELS
+    # 2. LOAD DATA & MODELS
     print(f"Loading Dataset: {args.dataset}...")
     dataset = d4rl_offline_dataset(args.dataset)
     real_obs = dataset['observations']
@@ -62,7 +77,7 @@ def visualize(args):
     smeme_ckpt = torch.load(args.smeme_checkpoint, map_location=device, weights_only=False)
     smeme.load_state_dict(smeme_ckpt['model'] if 'model' in smeme_ckpt else smeme_ckpt)
     
-    # 2. GENERATE SAMPLES
+    # 3. GENERATE SAMPLES
     N_real = min(len(real_obs), args.num_real_points)
     N_gen = args.num_generated_points
     
@@ -72,13 +87,13 @@ def visualize(args):
     data_base = generate_obs_samples(base, N_gen, real_obs.shape[1], args.num_inference_steps)
     data_smeme = generate_obs_samples(smeme, N_gen, real_obs.shape[1], args.num_inference_steps)
     
-    # 3. UMAP
+    # 4. UMAP
     print("Computing UMAP...")
+    # NOTE: UMAP respects np.random.seed, so results will be fixed
     all_data = np.vstack([data_real, data_base, data_smeme])
-    reducer = umap.UMAP(n_neighbors=50, min_dist=0.5, random_state=42)
+    reducer = umap.UMAP(n_neighbors=50, min_dist=0.5, random_state=args.seed)
     embedding = reducer.fit_transform(all_data)
     
-    # [FIXED] Correct slicing logic using explicit counts
     emb_real = embedding[:N_real]
     emb_base = embedding[N_real : N_real+N_gen]
     emb_smeme = embedding[N_real+N_gen :]
@@ -95,10 +110,7 @@ def visualize(args):
     print("Generating 'manifold_composite_lines.pdf'...")
     fig1, ax1 = plt.subplots(1, 1, figsize=(10, 8))
     
-    # [FIX] Use explicit levels=[0.05] instead of thresh/levels=1
-    # This draws exactly one line at the 5% iso-proportion (95% CI)
-    
-    # 1. Real Data: Dashed Grey Boundary
+    # 1. Real Data: Dashed Grey Boundary (95% confidence)
     sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], levels=[0.05], color=c_real, 
                 linewidths=2.0, linestyles="--", ax=ax1, fill=False)
 
@@ -131,18 +143,15 @@ def visualize(args):
     print("Generating 'manifold_cores.pdf'...")
     fig2, ax2 = plt.subplots(1, 1, figsize=(10, 8))
     
-    # [FIX] Use explicit range levels=[0.5, 1.0] for filled plots.
-    # This solves the "Filled contours require at least 2 levels" error.
-    
     # Real Data (Background Reference)
     sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], levels=[0.05, 1.0], color=c_real, 
                 fill=True, alpha=0.1, ax=ax2)
     
-    # Base Model Core (Blue) - Peaks only (Top 50%)
+    # Base Model Core (Blue)
     sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], levels=[0.5, 1.0], color=c_base, 
                 fill=True, alpha=0.5, ax=ax2)
     
-    # S-MEME Core (Orange) - Peaks only (Top 50%)
+    # S-MEME Core (Orange)
     sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], levels=[0.5, 1.0], color=c_smeme, 
                 fill=True, alpha=0.5, ax=ax2)
     
@@ -177,7 +186,7 @@ def visualize(args):
     plt.savefig("manifold_scatter.pdf", dpi=300)
     plt.close(fig3)
     
-    print("\n✅ DONE. Generated 3 plots.")
+    print("\n✅ DONE. Generated 3 plots with Seed:", args.seed)
 
 if __name__ == "__main__":
     sys.modules['__main__'].SMEMEConfig = SMEMEConfig
@@ -191,6 +200,9 @@ if __name__ == "__main__":
     parser.add_argument('--num_inference_steps', type=int, default=64)
     parser.add_argument('--num_real_points', type=int, default=50000)
     parser.add_argument('--num_generated_points', type=int, default=3000)
+    
+    # FIXED SEED ARGUMENT
+    parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility")
     
     parser.add_argument('--gin_config_files', nargs='*', default=['config/resmlp_denoiser.gin'])
     parser.add_argument('--gin_params', nargs='*', default=[])
