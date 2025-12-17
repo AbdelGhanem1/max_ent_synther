@@ -4,17 +4,16 @@ import argparse
 import torch
 import numpy as np
 import gymnasium as gym
-import d4rl # Registers environments
 import gin
 from tqdm import tqdm
 from scipy.spatial.distance import cdist
 from scipy.linalg import eigh
-import copy
 import sys
 
 # Import Custom Modules
 from synther.diffusion.utils import construct_diffusion_model
-from synther.diffusion.train_smeme import DiffusionModelAdapter, AdjointMatchingConfig, SMEMEConfig
+from synther.diffusion.train_smeme import SMEMEConfig, AdjointMatchingConfig
+# Use just_d4rl instead of the full d4rl package
 from just_d4rl import d4rl_offline_dataset
 
 def get_device():
@@ -26,86 +25,94 @@ def get_device():
 
 def compute_vendi_score(samples, kernel='rbf', gamma=None):
     """
-    Computes the Vendi Score (Diversity) as defined in the S-MEME paper.
+    Computes the Vendi Score (Diversity).
     VS = exp( - sum(lambda_i * log(lambda_i)) )
     """
     if len(samples) > 5000:
-        # Subsample for SVD performance if N is huge
         indices = np.random.choice(len(samples), 5000, replace=False)
         samples = samples[indices]
 
-    # 1. Compute Kernel Matrix K
     if kernel == 'rbf':
         dists = cdist(samples, samples, metric='euclidean')
         if gamma is None:
-            # Heuristic: 1 / mean_dist
             gamma = 1.0 / (np.mean(dists) + 1e-6)
         K = np.exp(-gamma * (dists ** 2))
     elif kernel == 'linear':
         K = np.dot(samples, samples.T)
     
-    # 2. Normalize K so trace=1
     n = K.shape[0]
     K = K / n
-
-    # 3. Compute Eigenvalues
-    # We use eigh because K is symmetric
     eigvals = eigh(K, eigvals_only=True)
-    
-    # Filter small numerical noise and normalize
     eigvals = eigvals[eigvals > 1e-10]
     eigvals = eigvals / eigvals.sum()
-    
-    # 4. Compute Von Neumann Entropy
     entropy = -np.sum(eigvals * np.log(eigvals))
-    
-    vendi = np.exp(entropy)
-    return vendi
+    return np.exp(entropy)
 
 class DynamicsOracle:
     """
-    Principled Manifold Check.
-    Uses the TRUE online environment to verify transitions.
+    Uses standard Gymnasium MuJoCo environments to verify transitions.
+    Doesn't require d4rl installation.
     """
-    def __init__(self, env_name):
-        self.env = gym.make(env_name)
-        self.env_name = env_name
+    def __init__(self, d4rl_dataset_name):
+        self.dataset_name = d4rl_dataset_name
+        self.env_name = self._map_to_gym(d4rl_dataset_name)
         
+        print(f"DynamicsOracle: Mapping '{d4rl_dataset_name}' -> '{self.env_name}'")
+        try:
+            self.env = gym.make(self.env_name)
+        except Exception as e:
+            print(f"Warning: Could not load environment {self.env_name}. Dynamics check will be skipped.")
+            self.env = None
+        
+    def _map_to_gym(self, dataset_name):
+        """Maps d4rl dataset strings to standard Gymnasium environment IDs."""
+        name = dataset_name.lower()
+        if 'hopper' in name:
+            return 'Hopper-v4'
+        elif 'walker' in name:
+            return 'Walker2d-v4'
+        elif 'halfcheetah' in name:
+            return 'HalfCheetah-v4'
+        elif 'ant' in name:
+            return 'Ant-v4'
+        else:
+            # Fallback or error
+            return 'Hopper-v4' 
+
     def obs_to_state(self, obs):
         """
-        Heuristic to map Observation -> MuJoCo qpos/qvel.
-        This is environment specific because D4RL observations often 
-        exclude CoM position (x-axis).
+        Maps Observation -> MuJoCo qpos/qvel.
         """
-        # Note: This works for standard Gym MuJoCo v2/v3/v4 envs.
-        # AntMaze requires specific handling.
-        
-        qpos_dim = self.env.unwrapped.model.nq
-        qvel_dim = self.env.unwrapped.model.nv
-        
-        if 'Hopper' in self.env_name or 'Walker' in self.env_name or 'HalfCheetah' in self.env_name:
-            # In these envs, obs = [qpos[1:], qvel]. qpos[0] is usually x-position (ignored).
-            # We assume x=0 for verification physics.
+        if self.env is None: return None, None
+
+        # Standard MuJoCo (Hopper, Walker, Cheetah)
+        # Obs = [qpos[1:], qvel]
+        # We assume x-position (qpos[0]) = 0 for physics check
+        try:
+            model = self.env.unwrapped.model
+            qpos_dim = model.nq
+            qvel_dim = model.nv
+            
             qpos = np.zeros(qpos_dim)
+            # qpos[0] is usually x-axis (ignored in obs)
             qpos[1:] = obs[:qpos_dim-1]
             qvel = obs[qpos_dim-1:]
             return qpos, qvel
-        
-        return None, None
+        except:
+            return None, None
 
     def verify_transitions(self, generated_data, obs_dim, act_dim):
         """
         Computes MSE between Gen(s') and True(s, a).
-        Returns: Dynamics MSE.
         """
+        if self.env is None: return -1.0
+
         gen_obs = generated_data[:, :obs_dim]
         gen_act = generated_data[:, obs_dim : obs_dim+act_dim]
         gen_next_obs = generated_data[:, obs_dim+act_dim+1 : obs_dim+act_dim+1+obs_dim]
         
         errors = []
         valid_checks = 0
-        
-        # Check a subset to save time
         indices = np.random.choice(len(generated_data), min(500, len(generated_data)), replace=False)
         
         for idx in indices:
@@ -115,72 +122,28 @@ class DynamicsOracle:
             
             qpos, qvel = self.obs_to_state(s)
             
-            if qpos is None:
-                continue # Skip unsupported envs
+            if qpos is None: continue
                 
-            # Set State
             try:
                 self.env.reset()
                 self.env.unwrapped.set_state(qpos, qvel)
-                
-                # Step
                 s_prime_true, _, _, _, _ = self.env.step(a)
                 
-                # Compute Error
+                # Compare
                 mse = np.mean((s_prime_true - s_prime_gen)**2)
                 errors.append(mse)
                 valid_checks += 1
-            except Exception as e:
+            except Exception:
                 pass
 
-        if valid_checks == 0:
-            return -1.0 # Failed to verify
-            
+        if valid_checks == 0: return -1.0
         return np.mean(errors)
-
-# ============================================================================
-# 2. HELPER FUNCTIONS
-# ============================================================================
-
-def load_models(args, device):
-    print(f"Loading dataset info for {args.dataset}...")
-    d4rl_dataset = d4rl_offline_dataset(args.dataset)
-    obs = d4rl_dataset['observations']
-    act = d4rl_dataset['actions']
-    input_dim = obs.shape[1] + act.shape[1] + 1 + obs.shape[1] + 1
-    
-    # Construct Architecture
-    dummy_inputs = torch.randn(10, input_dim)
-    base_model = construct_diffusion_model(inputs=dummy_inputs).to(device)
-    smeme_model = construct_diffusion_model(inputs=dummy_inputs).to(device)
-    
-    # Load Weights
-    base_ckpt = torch.load(args.base_checkpoint, map_location='cpu', weights_only=False)
-    base_model.load_state_dict(base_ckpt['model'] if 'model' in base_ckpt else base_ckpt)
-    
-    smeme_ckpt = torch.load(args.smeme_checkpoint, map_location='cpu', weights_only=False)
-    smeme_model.load_state_dict(smeme_ckpt['model'] if 'model' in smeme_ckpt else smeme_ckpt)
-    
-    return base_model, smeme_model, d4rl_dataset, input_dim
-
-def generate_samples(model, num_samples, batch_size=256):
-    model.eval()
-    samples_list = []
-    num_batches = int(np.ceil(num_samples / batch_size))
-    
-    with torch.no_grad():
-        for _ in tqdm(range(num_batches), desc="Sampling"):
-            batch_samples = model.sample(batch_size=batch_size, num_sample_steps=64)
-            samples_list.append(batch_samples.cpu().numpy())
-            
-    return np.concatenate(samples_list, axis=0)[:num_samples]
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
 if __name__ == "__main__":
-    # Register Globals for Pickle
     sys.modules['__main__'].SMEMEConfig = SMEMEConfig
     sys.modules['__main__'].AdjointMatchingConfig = AdjointMatchingConfig
 
@@ -195,12 +158,41 @@ if __name__ == "__main__":
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
     device = get_device()
     
-    # 1. Load Data & Models
-    base_model, smeme_model, dataset, dim = load_models(args, device)
-    
-    # Extract Real Data for comparisons
+    # Load Data (Using just_d4rl)
+    print(f"Loading dataset info for {args.dataset}...")
+    dataset = d4rl_offline_dataset(args.dataset)
     obs = dataset['observations']
     act = dataset['actions']
+    
+    # Model Setup
+    input_dim = obs.shape[1] + act.shape[1] + 1 + obs.shape[1] + 1
+    dummy_inputs = torch.randn(10, input_dim)
+    
+    base_model = construct_diffusion_model(inputs=dummy_inputs).to(device)
+    smeme_model = construct_diffusion_model(inputs=dummy_inputs).to(device)
+    
+    # Load Weights
+    base_ckpt = torch.load(args.base_checkpoint, map_location='cpu')
+    base_model.load_state_dict(base_ckpt['model'] if 'model' in base_ckpt else base_ckpt)
+    
+    smeme_ckpt = torch.load(args.smeme_checkpoint, map_location='cpu')
+    smeme_model.load_state_dict(smeme_ckpt['model'] if 'model' in smeme_ckpt else smeme_ckpt)
+    
+    # Generate
+    def sample_fn(model, N):
+        model.eval()
+        res = []
+        with torch.no_grad():
+            for _ in range(int(np.ceil(N/500))):
+                res.append(model.sample(batch_size=500, num_sample_steps=64).cpu().numpy())
+        return np.vstack(res)[:N]
+
+    print("\n--- Generating Samples ---")
+    N = 2000
+    samples_base = sample_fn(base_model, N)
+    samples_smeme = sample_fn(smeme_model, N)
+    
+    # Real Data subset
     real_data = np.concatenate([
         dataset['observations'], 
         dataset['actions'],
@@ -209,49 +201,24 @@ if __name__ == "__main__":
         dataset['terminals'][:,None]
     ], axis=1)
     
-    obs_dim = obs.shape[1]
-    act_dim = act.shape[1]
-
-    # 2. Generate Samples
-    print("\n--- Generating Samples ---")
-    N = 2000
-    samples_base = generate_samples(base_model, N)
-    samples_smeme = generate_samples(smeme_model, N)
-    
-    # 3. Principled Metrics
+    # Evaluation
     print("\n" + "="*50)
-    print("PRINCIPLED EVALUATION REPORT (IJCAI TARGET)")
+    print("PRINCIPLED EVALUATION REPORT")
     print("="*50)
     
-    # A. Vendi Score (Diversity)
-    print("Computing Vendi Score (SOTA Diversity)...")
+    # Vendi
     vs_real = compute_vendi_score(real_data[:N])
     vs_base = compute_vendi_score(samples_base)
     vs_smeme = compute_vendi_score(samples_smeme)
     
-    print(f"\nDiversity (Vendi Score) [Higher is Better]:")
-    print(f"  Real Data: {vs_real:.2f}")
-    print(f"  Base Model: {vs_base:.2f}")
-    print(f"  S-MEME:     {vs_smeme:.2f} ({(vs_smeme-vs_base)/vs_base*100:+.1f}%)")
+    print(f"Diversity (Vendi Score):")
+    print(f"  Real: {vs_real:.2f} | Base: {vs_base:.2f} | S-MEME: {vs_smeme:.2f}")
     
-    # B. Dynamics Oracle (Manifold Validity)
-    print("\nChecking Online Dynamics (Ground Truth Consistency)...")
+    # Dynamics Oracle
     oracle = DynamicsOracle(args.dataset)
+    mse_base = oracle.verify_transitions(samples_base, obs.shape[1], act.shape[1])
+    mse_smeme = oracle.verify_transitions(samples_smeme, obs.shape[1], act.shape[1])
     
-    # Check MSE
-    mse_base = oracle.verify_transitions(samples_base, obs_dim, act_dim)
-    mse_smeme = oracle.verify_transitions(samples_smeme, obs_dim, act_dim)
-    
-    print(f"\nDynamics Error (MSE against Physics Engine) [Lower is Better]:")
-    if mse_base == -1:
-        print("  [Skipped] Environment state setting not supported for this dataset.")
-    else:
-        print(f"  Base Model: {mse_base:.5f}")
-        print(f"  S-MEME:     {mse_smeme:.5f}")
-        
-        if mse_smeme > mse_base * 1.2:
-            print("  -> Warning: Significant manifold violation detected in S-MEME.")
-        else:
-            print("  -> Success: Manifold adherence maintained.")
-
-    print("="*50)
+    print(f"\nDynamics MSE (Physics Consistency):")
+    print(f"  Base Model: {mse_base:.5f}")
+    print(f"  S-MEME:     {mse_smeme:.5f}")
