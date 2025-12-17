@@ -170,30 +170,30 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
                 num_inference_steps=self.config.num_inference_steps
             )
             
-            # Get Score (S)
+            # Get Score (Points towards Data Mode)
             reward_grad = vector_field_fn(x_final_clean, 0).float()
             
-            # Normalize for Stability (Keep this!)
+            # Normalize (Keep this for stability!)
             grad_norm = torch.norm(reward_grad.reshape(reward_grad.shape[0], -1), dim=1, keepdim=True)
             scale_factor = torch.clamp(grad_norm, min=1.0) 
             reward_grad = reward_grad / scale_factor
             
-        # [CRITICAL FIX IS HERE]
-        # Previous (Wrong): adjoint_state = -self.config.reward_multiplier * reward_grad
-        # Correct: We want target = S, so diff moves by -S (Entropy direction).
-        adjoint_state = self.config.reward_multiplier * reward_grad
+        # [CRITICAL CORRECTION]
+        # Restore the NEGATIVE sign.
+        # We want to move in direction -Score (Entropy), not +Score (Likelihood).
+        # Previous erroneous advice removed this. Put it back!
+        adjoint_state = -self.config.reward_multiplier * reward_grad
         
         # 3. Backward Pass (Standard Adjoint Logic)
         adjoint_storage = {}
         for k in range(self.config.num_inference_steps - 1, -1, -1):
             t_val = timesteps[k].item()
             x_k = traj[k]
-            # Note: _grad_inner_product usually adds to the adjoint state based on Jacobian
             vjp = self._grad_inner_product(x_k, t_val, adjoint_state, prompt_emb)
             adjoint_state = adjoint_state + vjp
             adjoint_storage[k] = adjoint_state
             
-        # 4. Loss Computation (Keep Float32 Force)
+        # 4. Loss Computation (Float32 forced)
         active_indices = self._sample_time_indices(
             self.config.num_inference_steps, 
             self.config.num_timesteps_to_load, 
