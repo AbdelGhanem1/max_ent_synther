@@ -170,12 +170,13 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
                 num_inference_steps=self.config.num_inference_steps
             )
             
-            # Get Score (Points towards Data Mode)
             reward_grad = vector_field_fn(x_final_clean, 0).float()
             
-            # Normalize (Keep this for stability!)
+            # [MODIFICATION] LOOSEN THE CLAMP
+            # Previous: scale_factor = torch.clamp(grad_norm, min=1.0) (Too weak!)
+            # New: Allow norms up to 50.0 before clipping.
             grad_norm = torch.norm(reward_grad.reshape(reward_grad.shape[0], -1), dim=1, keepdim=True)
-            scale_factor = torch.clamp(grad_norm, min=1.0) 
+            scale_factor = torch.clamp(grad_norm / 50.0, min=1.0) 
             reward_grad = reward_grad / scale_factor
             
         # [CRITICAL CORRECTION]
