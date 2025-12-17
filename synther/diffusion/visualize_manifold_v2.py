@@ -48,7 +48,7 @@ def visualize(args):
     base = construct_diffusion_model(inputs=dummy).to(device)
     smeme = construct_diffusion_model(inputs=dummy).to(device)
     
-    # [FIXED: Added weights_only=False]
+    # Weights Only = False to fix the loading error
     base_ckpt = torch.load(args.base_checkpoint, map_location=device, weights_only=False)
     base.load_state_dict(base_ckpt['model'] if 'model' in base_ckpt else base_ckpt)
 
@@ -74,7 +74,9 @@ def visualize(args):
     emb_smeme = embedding[2*N:]
     
     fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-    colors = sns.color_palette("colorblind", 3)
+    
+    # [FIX] Request the full 10-color palette so indices 7 and 3 exist
+    colors = sns.color_palette("colorblind", 10)
     c_real, c_base, c_smeme = colors[7], colors[0], colors[3] 
     
     # 1. Real Data (Background Density)
@@ -111,7 +113,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--base_checkpoint', type=str, required=True)
     parser.add_argument('--smeme_checkpoint', type=str, required=True)
-    parser.add_argument('--num_points', type=int, default=2000, help="Number of points to sample per model") # Added
+    parser.add_argument('--num_points', type=int, default=2000, help="Number of points to sample per model") 
     parser.add_argument('--gin_config_files', nargs='*', default=['config/resmlp_denoiser.gin'])
     parser.add_argument('--gin_params', nargs='*', default=[])
     
