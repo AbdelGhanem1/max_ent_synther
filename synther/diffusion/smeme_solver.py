@@ -170,30 +170,30 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
                 num_inference_steps=self.config.num_inference_steps
             )
             
-            # [CRITICAL] Reward grad might be large, keep float32
+            # Get Score (S)
             reward_grad = vector_field_fn(x_final_clean, 0).float()
             
-            # [STABILITY FIX] Normalize the reward gradient
-            # The raw score can be huge (100+). We normalize it to have a reasonable scale.
-            # This prevents the initial "kick" of the backward ODE from being Infinite.
+            # Normalize for Stability (Keep this!)
             grad_norm = torch.norm(reward_grad.reshape(reward_grad.shape[0], -1), dim=1, keepdim=True)
-            # Clip the norm to a max value (e.g., 1.0 or 10.0) to prevent explosion
-            # but allow small gradients to pass through.
             scale_factor = torch.clamp(grad_norm, min=1.0) 
             reward_grad = reward_grad / scale_factor
             
-        adjoint_state = -self.config.reward_multiplier * reward_grad
+        # [CRITICAL FIX IS HERE]
+        # Previous (Wrong): adjoint_state = -self.config.reward_multiplier * reward_grad
+        # Correct: We want target = S, so diff moves by -S (Entropy direction).
+        adjoint_state = self.config.reward_multiplier * reward_grad
         
-        # 3. Backward Pass
+        # 3. Backward Pass (Standard Adjoint Logic)
         adjoint_storage = {}
         for k in range(self.config.num_inference_steps - 1, -1, -1):
             t_val = timesteps[k].item()
             x_k = traj[k]
+            # Note: _grad_inner_product usually adds to the adjoint state based on Jacobian
             vjp = self._grad_inner_product(x_k, t_val, adjoint_state, prompt_emb)
             adjoint_state = adjoint_state + vjp
             adjoint_storage[k] = adjoint_state
             
-        # 4. Loss Computation (Float32 forced)
+        # 4. Loss Computation (Keep Float32 Force)
         active_indices = self._sample_time_indices(
             self.config.num_inference_steps, 
             self.config.num_timesteps_to_load, 
@@ -209,7 +209,7 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             
             t_tensor = torch.tensor([t_val], device=device).repeat(batch_size)
             
-            # Force Float32 for model output and loss
+            # Force Float32
             eps_fine = self.model_fine(x_k, t_tensor, prompt_emb).float()
             
             with torch.no_grad():
@@ -220,13 +220,12 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             
             diff = (eps_fine - eps_pre)
             
-            # [FIX] Force target calculation in float32
+            # Force Float32 target
             target = target_adjoint.float() * std_dev_t.view(-1, 1).float()
             
-            # Loss Calculation
             loss_per_sample = torch.sum((diff + target) ** 2, dim=1)
             
-            # EMA Clipping (Ensure float32)
+            # EMA Clipping
             loss_root = torch.sqrt(loss_per_sample.detach())
             current_quantile = torch.quantile(loss_root, self.config.per_sample_threshold_quantile)
             ema_threshold = self._ema_update(current_quantile)
