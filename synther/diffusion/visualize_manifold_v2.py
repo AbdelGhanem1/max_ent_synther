@@ -1,4 +1,4 @@
-# synther/diffusion/visualize_manifold_final.py
+# synther/diffusion/visualize_manifold_stable.py
 
 import argparse
 import torch
@@ -33,7 +33,6 @@ def get_device():
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def set_seed(seed):
-    """Sets the seed for reproducibility."""
     print(f"Setting global seed to {seed}...")
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -56,11 +55,10 @@ def generate_obs_samples(model, num_samples, obs_dim, num_inference_steps):
     return np.vstack(samples)[:num_samples]
 
 def visualize(args):
-    # 1. SET SEED
     set_seed(args.seed)
     device = get_device()
     
-    # 2. LOAD DATA & MODELS
+    # 1. LOAD DATA & MODELS
     print(f"Loading Dataset: {args.dataset}...")
     dataset = d4rl_offline_dataset(args.dataset)
     real_obs = dataset['observations']
@@ -77,8 +75,9 @@ def visualize(args):
     smeme_ckpt = torch.load(args.smeme_checkpoint, map_location=device, weights_only=False)
     smeme.load_state_dict(smeme_ckpt['model'] if 'model' in smeme_ckpt else smeme_ckpt)
     
-    # 3. GENERATE SAMPLES
-    N_real = min(len(real_obs), args.num_real_points)
+    # 2. GENERATE SAMPLES
+    # Use MORE real points to build a stable map
+    N_real = min(len(real_obs), 50000) 
     N_gen = args.num_generated_points
     
     idx = np.random.choice(len(real_obs), N_real, replace=False)
@@ -87,16 +86,24 @@ def visualize(args):
     data_base = generate_obs_samples(base, N_gen, real_obs.shape[1], args.num_inference_steps)
     data_smeme = generate_obs_samples(smeme, N_gen, real_obs.shape[1], args.num_inference_steps)
     
-    # 4. UMAP
-    print("Computing UMAP...")
-    # NOTE: UMAP respects np.random.seed, so results will be fixed
-    all_data = np.vstack([data_real, data_base, data_smeme])
+    # 3. UMAP (THE STABLE METHOD)
+    print("Computing Stable UMAP...")
+    print("  1. Fitting Map on Real Data ONLY (The Anchor)...")
     reducer = umap.UMAP(n_neighbors=50, min_dist=0.5, random_state=args.seed)
-    embedding = reducer.fit_transform(all_data)
+    reducer.fit(data_real) # <--- CRITICAL CHANGE: Only fit on real data
     
-    emb_real = embedding[:N_real]
-    emb_base = embedding[N_real : N_real+N_gen]
-    emb_smeme = embedding[N_real+N_gen :]
+    print("  2. Projecting Real Data...")
+    emb_real = reducer.transform(data_real)
+    
+    print("  3. Projecting Base Model...")
+    emb_base = reducer.transform(data_base)
+    
+    print("  4. Projecting S-MEME...")
+    emb_smeme = reducer.transform(data_smeme)
+
+    # Note: We downsample Real Data for plotting so the PDF doesn't explode
+    plot_idx = np.random.choice(len(emb_real), min(len(emb_real), 10000), replace=False)
+    emb_real_plot = emb_real[plot_idx]
 
     # COLORS
     colors = sns.color_palette("colorblind", 10) 
@@ -105,88 +112,37 @@ def visualize(args):
     c_smeme = colors[3] # Orange/Vermillion
 
     # ========================================================================
-    # FIGURE 1: THE CLEAN COMPOSITE (Best for Paper)
+    # FIGURE: COMPOSITE
     # ========================================================================
-    print("Generating 'manifold_composite_lines.pdf'...")
+    print("Generating 'manifold_stable.pdf'...")
     fig1, ax1 = plt.subplots(1, 1, figsize=(10, 8))
     
-    # 1. Real Data: Dashed Grey Boundary (95% confidence)
-    sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], levels=[0.05], color=c_real, 
+    # Real Data
+    sns.kdeplot(x=emb_real_plot[:,0], y=emb_real_plot[:,1], levels=[0.05], color=c_real, 
                 linewidths=2.0, linestyles="--", ax=ax1, fill=False)
 
-    # 2. Base Model: Solid Blue Boundary
+    # Base Model
     sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], levels=[0.05], color=c_base, 
                 linewidths=3.0, ax=ax1, fill=False)
     
-    # 3. S-MEME: Solid Orange Boundary
+    # S-MEME
     sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], levels=[0.05], color=c_smeme, 
                 linewidths=3.0, ax=ax1, fill=False)
 
-    ax1.set_title(f"Manifold Boundaries (95% Confidence)", fontweight='bold', pad=20)
+    ax1.set_title(f"Stable Manifold Projection", fontweight='bold', pad=20)
     ax1.set_xticks([])
     ax1.set_yticks([])
     sns.despine(left=True, bottom=True)
     
     legend_1 = [
-        Line2D([0], [0], color=c_real, lw=2.0, linestyle="--", label='Real Data Support'),
-        Line2D([0], [0], color=c_base, lw=3.0, label='Base Model Support'),
-        Line2D([0], [0], color=c_smeme, lw=3.0, label='S-MEME Support'),
+        Line2D([0], [0], color=c_real, lw=2.0, linestyle="--", label='Real Data'),
+        Line2D([0], [0], color=c_base, lw=3.0, label='Base Model'),
+        Line2D([0], [0], color=c_smeme, lw=3.0, label='S-MEME'),
     ]
     ax1.legend(handles=legend_1, loc='upper right', frameon=True, framealpha=0.95)
     plt.tight_layout()
-    plt.savefig("manifold_composite_lines.pdf", dpi=300)
-    plt.close(fig1)
-
-    # ========================================================================
-    # FIGURE 2: THE CORES (High Density Peaks Only)
-    # ========================================================================
-    print("Generating 'manifold_cores.pdf'...")
-    fig2, ax2 = plt.subplots(1, 1, figsize=(10, 8))
-    
-    # Real Data (Background Reference)
-    sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], levels=[0.05, 1.0], color=c_real, 
-                fill=True, alpha=0.1, ax=ax2)
-    
-    # Base Model Core (Blue)
-    sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], levels=[0.5, 1.0], color=c_base, 
-                fill=True, alpha=0.5, ax=ax2)
-    
-    # S-MEME Core (Orange)
-    sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], levels=[0.5, 1.0], color=c_smeme, 
-                fill=True, alpha=0.5, ax=ax2)
-    
-    ax2.set_title(f"High-Density Modes (Top 50%)", fontweight='bold', pad=20)
-    ax2.set_xticks([])
-    ax2.set_yticks([])
-    sns.despine(left=True, bottom=True)
-    
-    legend_2 = [
-        Line2D([0], [0], color=c_real, lw=10, alpha=0.2, label='Real Data (Global)'),
-        Line2D([0], [0], color=c_base, lw=10, alpha=0.5, label='Base Model Core'),
-        Line2D([0], [0], color=c_smeme, lw=10, alpha=0.5, label='S-MEME Core'),
-    ]
-    ax2.legend(handles=legend_2, loc='upper right')
-    plt.tight_layout()
-    plt.savefig("manifold_cores.pdf", dpi=300)
-    plt.close(fig2)
-
-    # ========================================================================
-    # FIGURE 3: THE SCATTER (Raw Reference)
-    # ========================================================================
-    print("Generating 'manifold_scatter.pdf'...")
-    fig3, ax3 = plt.subplots(1, 1, figsize=(10, 8))
-    ax3.scatter(emb_real[:,0], emb_real[:,1], c=[c_real], s=2, alpha=0.05)
-    ax3.scatter(emb_base[:,0], emb_base[:,1], c=[c_base], s=15, alpha=0.4, label='Base')
-    ax3.scatter(emb_smeme[:,0], emb_smeme[:,1], c=[c_smeme], s=25, alpha=0.5, marker='x', label='S-MEME')
-    ax3.legend(loc='upper right')
-    ax3.set_xticks([])
-    ax3.set_yticks([])
-    sns.despine(left=True, bottom=True)
-    plt.tight_layout()
-    plt.savefig("manifold_scatter.pdf", dpi=300)
-    plt.close(fig3)
-    
-    print("\n✅ DONE. Generated 3 plots with Seed:", args.seed)
+    plt.savefig("manifold_stable.pdf", dpi=300)
+    print("✅ Saved to manifold_stable.pdf")
 
 if __name__ == "__main__":
     sys.modules['__main__'].SMEMEConfig = SMEMEConfig
@@ -196,14 +152,9 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--base_checkpoint', type=str, required=True)
     parser.add_argument('--smeme_checkpoint', type=str, required=True)
-    
     parser.add_argument('--num_inference_steps', type=int, default=64)
-    parser.add_argument('--num_real_points', type=int, default=50000)
     parser.add_argument('--num_generated_points', type=int, default=3000)
-    
-    # FIXED SEED ARGUMENT
-    parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility")
-    
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--gin_config_files', nargs='*', default=['config/resmlp_denoiser.gin'])
     parser.add_argument('--gin_params', nargs='*', default=[])
     
