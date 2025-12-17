@@ -78,8 +78,8 @@ def visualize(args):
     reducer = umap.UMAP(n_neighbors=50, min_dist=0.5, random_state=42)
     embedding = reducer.fit_transform(all_data)
     
+    # FIX: Correct slicing using N_real and N_gen
     emb_real = embedding[:N_real]
-    emb_base = embedding[N:2*N] # Fixed indexing just in case N_real != N_gen
     emb_base = embedding[N_real : N_real+N_gen]
     emb_smeme = embedding[N_real+N_gen :]
 
@@ -94,8 +94,6 @@ def visualize(args):
     # ========================================================================
     print("Generating 'manifold_composite_lines.pdf'...")
     fig1, ax1 = plt.subplots(1, 1, figsize=(10, 8))
-    
-    # FIX: Use thresh + levels=1 instead of levels=[0.05]
     
     # 1. Real Data: Dashed Grey Boundary
     sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], thresh=0.05, levels=1, color=c_real, 
@@ -130,17 +128,15 @@ def visualize(args):
     print("Generating 'manifold_cores.pdf'...")
     fig2, ax2 = plt.subplots(1, 1, figsize=(10, 8))
     
-    # FIX: Use thresh=0.5 (Top 50%) and levels=1 to create a single filled blob
-    
     # Real Data (Background Reference)
     sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], thresh=0.05, levels=1, color=c_real, 
                 fill=True, alpha=0.1, ax=ax2)
     
-    # Base Model Core (Blue) - Peaks only
+    # Base Model Core (Blue) - Peaks only (Top 50%)
     sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], thresh=0.5, levels=1, color=c_base, 
                 fill=True, alpha=0.5, ax=ax2)
     
-    # S-MEME Core (Orange) - Peaks only
+    # S-MEME Core (Orange) - Peaks only (Top 50%)
     sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], thresh=0.5, levels=1, color=c_smeme, 
                 fill=True, alpha=0.5, ax=ax2)
     
