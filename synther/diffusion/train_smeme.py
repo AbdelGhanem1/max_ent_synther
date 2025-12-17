@@ -66,11 +66,23 @@ class DiffusionModelAdapter(nn.Module):
     def get_sigma_at_step(self, t_idx_tensor):
         """
         Calculates sigma for a given integer timestep index k.
-        t_continuous = k * h
         """
-        # Map integer index [0, 1000] -> continuous t [0, 1]
-        t_continuous = t_idx_tensor.float() / self.config.num_train_timesteps
+        # [MODIFICATION] Invert the time axis!
+        # Original (WRONG): t_continuous = t_idx_tensor.float() / self.config.num_train_timesteps
+        #
+        # Explanation:
+        # The Solver counts DOWN from 1000 -> 0.
+        # We want Sigma to go from High -> Low.
+        # The formula sqrt(2(1-t+h)/(t+h)) gives High Sigma when t is roughly 0.
+        # So we map 1000 -> 0.0 and 0 -> 1.0.
         
+        # 1. Normalize 1000 -> 1.0
+        norm_t = t_idx_tensor.float() / self.config.num_train_timesteps
+        
+        # 2. Invert so Start(1000) becomes 0.0 (High Sigma)
+        t_continuous = 1.0 - norm_t
+        
+        # 3. Apply formula
         numerator = 2 * (1 - t_continuous + self.h)
         denominator = t_continuous + self.h
         sigma = torch.sqrt(numerator / denominator)
