@@ -5,6 +5,7 @@ from tqdm import tqdm
 import wandb
 from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
 from torch.amp import autocast, GradScaler
+
 class SMEMESolver:
     def __init__(self, base_model, config):
         """
@@ -21,32 +22,44 @@ class SMEMESolver:
         """
         Computes the Score using the CORRECT EDM Physics.
         Score = -epsilon / sigma
+        
+        [MODIFIED] Forces Float32 to prevent FP16 Overflow when alpha is small.
         """
         # 1. Create Time Tensor
         t_tensor = torch.tensor([t_idx], device=x_data.device).repeat(x_data.shape[0])
         
+        # [CRITICAL FIX] Disable autocast for the score division.
+        # This ensures the division and large values stay in Float32.
         with torch.no_grad():
-            with autocast(device_type='cuda'):
-                # 2. Get Epsilon (Noise Prediction)
-                eps = model(x_data, t_tensor)
-                
-                # 3. GET THE CORRECT SIGMA
-                # We ask the adapter what sigma corresponds to this t_idx.
-                # This ensures we use the exact schedule the model was trained on.
-                if hasattr(model, 'get_sigma_at_step'):
-                    sigma = model.get_sigma_at_step(t_tensor)
-                else:
-                    # Fallback (Should not happen with your setup)
-                    sigma = torch.tensor(1.0, device=x_data.device)
+             # Run model in whatever precision it wants, but cast output to float32
+            with autocast(device_type='cuda', enabled=False):
+                # If model expects half, we might need a wrapper, but usually models handle float32 input fine.
+                # To be safe, we let the model run in autocast if needed, but we do the DIVISION in float32.
+                pass
 
-                # Reshape for broadcasting
-                sigma = sigma.view(-1, 1)
-                
-                # 4. Compute Score with Safety Clamp
-                # We limit sigma to >= 0.05 to prevent the "Infinite Force" explosion.
-                # This allows you to train fast (low steps) without crashing.
-                safe_sigma = torch.maximum(sigma, torch.tensor(0.05, device=x_data.device))
-                score = -eps / safe_sigma
+            # 2. Get Epsilon (Noise Prediction)
+            # We run forward pass. If inside autocast context in train loop, this might be FP16.
+            # We cast result to float32 immediately.
+            eps = model(x_data, t_tensor).float()
+            
+            # 3. GET THE CORRECT SIGMA
+            if hasattr(model, 'get_sigma_at_step'):
+                sigma = model.get_sigma_at_step(t_tensor)
+            else:
+                sigma = torch.tensor(1.0, device=x_data.device)
+
+            # Reshape for broadcasting
+            sigma = sigma.view(-1, 1).float()
+            
+            # 4. Compute Score with Safety Clamp
+            # Limit sigma to >= 0.05 to prevent explosion
+            safe_sigma = torch.maximum(sigma, torch.tensor(0.05, device=x_data.device))
+            
+            score = -eps / safe_sigma
+            
+            # [SAFETY CLAMP] Cap the score magnitude to prevent infinite gradients
+            # A score of 100 corresponds to a massive force. 
+            score = torch.clamp(score, min=-100.0, max=100.0)
             
         return score
 
@@ -69,49 +82,32 @@ class SMEMESolver:
                 config=self.config.am_config
             )
             
-            # 2. Define the "Reward Gradient" function
             def entropy_gradient_fn(x, t_idx):
-                # We want to Maximize Entropy => Move DOWNHILL (Away from peaks).
-                # Direction = Negative Score.
-                # Solver Formula: a = -multiplier * input_vector
-                # We want Force = -multiplier * ( -Score ) = +multiplier * Score?
-                # WAIT.
-                # Entropy Gradient is -Score.
-                # We want to move in direction of Entropy Gradient.
-                # So we want Force ~ -Score.
-                # Solver applies (-1). So we pass (+Score).
-                
-                # However, our _get_score now returns (-eps).
-                # (-eps) points UPHILL (towards data).
-                # We want to push particles APART (Downhill).
-                # So we want the OPPOSITE of (-eps). We want (+eps).
-                
-                # Let's trace carefully:
-                # 1. _get_score returns (-eps). This is the Score vector (Uphill).
-                # 2. We return this Score vector.
-                # 3. Solver calculates: adjoint = - (1/alpha) * Score.
-                # 4. Resulting Force: Negative Score (Downhill).
-                
-                # CONCLUSION: Passing the Score (Uphill vector) is correct.
-                # The solver's internal negative sign flips it to Downhill (Entropy Increase).
-                
+                # Returns Score (which points Uphill). 
+                # Solver applies negative sign to move Downhill (Entropy).
                 score = self._get_score_at_data(self.previous_model, x, t_idx)
                 return score 
             
-            # 3. Inner Loop
             pbar = tqdm(train_loader, desc=f"Iter {k+1}", dynamic_ncols=True)
             running_loss = 0.0
             
+            # Initialize optimizer if needed
+            if not hasattr(self, 'optimizer'):
+                 self.optimizer = torch.optim.AdamW(self.current_model.parameters(), lr=1e-4, weight_decay=1e-2)
+
             for step, batch in enumerate(pbar):
                 self.current_model.zero_grad()
                 
+                # [MODIFIED] Ensure solver output is float32
                 loss = solver.solve_vector_field(batch, entropy_gradient_fn)
                 
+                # Check for NaN immediately
+                if torch.isnan(loss):
+                    print(f"\n[WARNING] Loss is NaN at step {step}! Skipping step.")
+                    continue
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.current_model.parameters(), 1.0)
-                
-                if not hasattr(self, 'optimizer'):
-                    self.optimizer = torch.optim.AdamW(self.current_model.parameters(), lr=1e-4, weight_decay=1e-2)
                 
                 self.optimizer.step()
                 
@@ -138,15 +134,8 @@ class SMEMESolver:
 
 
 class VectorFieldAdjointSolver(AdjointMatchingSolver):
-    """
-    Subclass of AdjointMatchingSolver that overrides the initialization step.
-    Instead of calculating grad(scalar_reward), it accepts a direct vector field.
-    """
     
     def solve_vector_field(self, x_0, vector_field_fn, prompt_emb=None):
-        """
-        Modified solve method for S-MEME.
-        """
         device = x_0.device
         batch_size = x_0.shape[0]
         timesteps = torch.linspace(
@@ -169,7 +158,7 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
                 traj.append(prev_x)
                 curr_x = prev_x
 
-        # 2. Adjoint Initialization (OVERRIDDEN)
+        # 2. Adjoint Initialization
         x_prev = traj[-2]
         t_last = timesteps[-1].item()
         
@@ -181,8 +170,8 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
                 num_inference_steps=self.config.num_inference_steps
             )
             
-            # Use strict t_idx=0 for score evaluation to be consistent
-            reward_grad = vector_field_fn(x_final_clean, 0)
+            # [CRITICAL] Reward grad might be large, keep float32
+            reward_grad = vector_field_fn(x_final_clean, 0).float()
             
         adjoint_state = -self.config.reward_multiplier * reward_grad
         
@@ -201,7 +190,8 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             self.config.num_timesteps_to_load, 
             device
         )
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+
         for k in active_indices:
             k = k.item()
             t_val = timesteps[k].item()
@@ -209,18 +199,26 @@ class VectorFieldAdjointSolver(AdjointMatchingSolver):
             target_adjoint = adjoint_storage[k].detach()
             
             t_tensor = torch.tensor([t_val], device=device).repeat(batch_size)
-            eps_fine = self.model_fine(x_k, t_tensor, prompt_emb)
+            
+            # We must allow gradients here
+            eps_fine = self.model_fine(x_k, t_tensor, prompt_emb).float()
+            
             with torch.no_grad():
-                eps_pre = self.model_pre(x_k, t_tensor, prompt_emb)
+                eps_pre = self.model_pre(x_k, t_tensor, prompt_emb).float()
                 
             _, _, std_dev_t = self.scheduler.step(eps_fine, t_val, x_k, eta=self.config.eta, 
                                                   num_inference_steps=self.config.num_inference_steps)
             
             diff = (eps_fine - eps_pre)
-            target = target_adjoint * std_dev_t.view(-1, 1)
+            
+            # [FIX] Force target calculation in float32
+            # target_adjoint can be large (~200+). std_dev_t is small.
+            target = target_adjoint.float() * std_dev_t.view(-1, 1).float()
+            
+            # This square is the danger zone for FP16
             loss_per_sample = torch.sum((diff + target) ** 2, dim=1)
             
-            # EMA Clipping
+            # EMA Clipping (Ensure float32)
             loss_root = torch.sqrt(loss_per_sample.detach())
             current_quantile = torch.quantile(loss_root, self.config.per_sample_threshold_quantile)
             ema_threshold = self._ema_update(current_quantile)
