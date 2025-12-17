@@ -78,7 +78,7 @@ def visualize(args):
     reducer = umap.UMAP(n_neighbors=50, min_dist=0.5, random_state=42)
     embedding = reducer.fit_transform(all_data)
     
-    # FIX: Correct slicing using N_real and N_gen
+    # [FIXED] Correct slicing logic using explicit counts
     emb_real = embedding[:N_real]
     emb_base = embedding[N_real : N_real+N_gen]
     emb_smeme = embedding[N_real+N_gen :]
@@ -95,16 +95,19 @@ def visualize(args):
     print("Generating 'manifold_composite_lines.pdf'...")
     fig1, ax1 = plt.subplots(1, 1, figsize=(10, 8))
     
+    # [FIX] Use explicit levels=[0.05] instead of thresh/levels=1
+    # This draws exactly one line at the 5% iso-proportion (95% CI)
+    
     # 1. Real Data: Dashed Grey Boundary
-    sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], thresh=0.05, levels=1, color=c_real, 
+    sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], levels=[0.05], color=c_real, 
                 linewidths=2.0, linestyles="--", ax=ax1, fill=False)
 
     # 2. Base Model: Solid Blue Boundary
-    sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], thresh=0.05, levels=1, color=c_base, 
+    sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], levels=[0.05], color=c_base, 
                 linewidths=3.0, ax=ax1, fill=False)
     
     # 3. S-MEME: Solid Orange Boundary
-    sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], thresh=0.05, levels=1, color=c_smeme, 
+    sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], levels=[0.05], color=c_smeme, 
                 linewidths=3.0, ax=ax1, fill=False)
 
     ax1.set_title(f"Manifold Boundaries (95% Confidence)", fontweight='bold', pad=20)
@@ -128,16 +131,19 @@ def visualize(args):
     print("Generating 'manifold_cores.pdf'...")
     fig2, ax2 = plt.subplots(1, 1, figsize=(10, 8))
     
+    # [FIX] Use explicit range levels=[0.5, 1.0] for filled plots.
+    # This solves the "Filled contours require at least 2 levels" error.
+    
     # Real Data (Background Reference)
-    sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], thresh=0.05, levels=1, color=c_real, 
+    sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], levels=[0.05, 1.0], color=c_real, 
                 fill=True, alpha=0.1, ax=ax2)
     
     # Base Model Core (Blue) - Peaks only (Top 50%)
-    sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], thresh=0.5, levels=1, color=c_base, 
+    sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], levels=[0.5, 1.0], color=c_base, 
                 fill=True, alpha=0.5, ax=ax2)
     
     # S-MEME Core (Orange) - Peaks only (Top 50%)
-    sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], thresh=0.5, levels=1, color=c_smeme, 
+    sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], levels=[0.5, 1.0], color=c_smeme, 
                 fill=True, alpha=0.5, ax=ax2)
     
     ax2.set_title(f"High-Density Modes (Top 50%)", fontweight='bold', pad=20)
