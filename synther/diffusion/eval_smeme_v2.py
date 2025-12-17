@@ -171,11 +171,11 @@ if __name__ == "__main__":
     base_model = construct_diffusion_model(inputs=dummy_inputs).to(device)
     smeme_model = construct_diffusion_model(inputs=dummy_inputs).to(device)
     
-    # Load Weights
-    base_ckpt = torch.load(args.base_checkpoint, map_location='cpu')
+    # Load Weights [FIXED: Added weights_only=False]
+    base_ckpt = torch.load(args.base_checkpoint, map_location='cpu', weights_only=False)
     base_model.load_state_dict(base_ckpt['model'] if 'model' in base_ckpt else base_ckpt)
     
-    smeme_ckpt = torch.load(args.smeme_checkpoint, map_location='cpu')
+    smeme_ckpt = torch.load(args.smeme_checkpoint, map_location='cpu', weights_only=False)
     smeme_model.load_state_dict(smeme_ckpt['model'] if 'model' in smeme_ckpt else smeme_ckpt)
     
     # Generate

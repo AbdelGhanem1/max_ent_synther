@@ -48,8 +48,12 @@ def visualize(args):
     base = construct_diffusion_model(inputs=dummy).to(device)
     smeme = construct_diffusion_model(inputs=dummy).to(device)
     
-    base.load_state_dict(torch.load(args.base_checkpoint, map_location=device)['model'])
-    smeme.load_state_dict(torch.load(args.smeme_checkpoint, map_location=device)['model'])
+    # [FIXED: Added weights_only=False]
+    base_ckpt = torch.load(args.base_checkpoint, map_location=device, weights_only=False)
+    base.load_state_dict(base_ckpt['model'] if 'model' in base_ckpt else base_ckpt)
+
+    smeme_ckpt = torch.load(args.smeme_checkpoint, map_location=device, weights_only=False)
+    smeme.load_state_dict(smeme_ckpt['model'] if 'model' in smeme_ckpt else smeme_ckpt)
     
     # Use user argument for N
     N = args.num_points
