@@ -31,15 +31,21 @@ plt.rcParams.update({
 def get_device():
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def generate_obs_samples(model, num_samples, obs_dim):
+def generate_obs_samples(model, num_samples, obs_dim, num_inference_steps):
+    """Generates samples using the specified number of diffusion steps."""
     model.eval()
     samples = []
-    bs = 1000  # Faster batch size
+    bs = 1000  # Efficient batch size
     iters = int(np.ceil(num_samples/bs))
+    
+    print(f"  -> Sampling with {num_inference_steps} steps...")
+    
     with torch.no_grad():
         for _ in range(iters):
-            batch = model.sample(batch_size=bs, num_sample_steps=64)
+            # Pass the user-defined step count to the model
+            batch = model.sample(batch_size=bs, num_sample_steps=num_inference_steps)
             samples.append(batch.cpu().numpy()[:, :obs_dim])
+            
     return np.vstack(samples)[:num_samples]
 
 def visualize(args):
@@ -57,7 +63,7 @@ def visualize(args):
     base = construct_diffusion_model(inputs=dummy).to(device)
     smeme = construct_diffusion_model(inputs=dummy).to(device)
     
-    # Load Weights (Fixing weights_only=False for safety error)
+    # Load Weights (weights_only=False)
     print("Loading Checkpoints...")
     base_ckpt = torch.load(args.base_checkpoint, map_location=device, weights_only=False)
     base.load_state_dict(base_ckpt['model'] if 'model' in base_ckpt else base_ckpt)
@@ -67,14 +73,16 @@ def visualize(args):
     
     # 2. GENERATE SAMPLES
     N = args.num_points
-    print(f"Generating {N} samples per model...")
+    steps = args.num_inference_steps
+    print(f"Generating {N} samples per model (Steps={steps})...")
     
     idx = np.random.choice(len(real_obs), N, replace=False)
     data_real = real_obs[idx]
-    data_base = generate_obs_samples(base, N, real_obs.shape[1])
-    data_smeme = generate_obs_samples(smeme, N, real_obs.shape[1])
     
-    # 3. UMAP PROJECTION (Done once)
+    data_base = generate_obs_samples(base, N, real_obs.shape[1], steps)
+    data_smeme = generate_obs_samples(smeme, N, real_obs.shape[1], steps)
+    
+    # 3. UMAP PROJECTION
     print("Computing UMAP Projection (this may take a moment)...")
     all_data = np.vstack([data_real, data_base, data_smeme])
     reducer = umap.UMAP(n_neighbors=50, min_dist=0.5, random_state=42)
@@ -85,19 +93,18 @@ def visualize(args):
     emb_smeme = embedding[2*N:]
 
     # COLORS (Colorblind Friendly)
-    # 0=Blue, 3=Orange, 7=Grey
     colors = sns.color_palette("colorblind", 10) 
     c_real = colors[7]  # Grey
     c_base = colors[0]  # Blue
     c_smeme = colors[3] # Orange/Reddish
 
     # ========================================================================
-    # FIGURE 1: SCATTER PLOT (Particles)
+    # FIGURE 1: SCATTER PLOT
     # ========================================================================
     print("Generating Figure 1: Scatter Plot...")
     fig1, ax1 = plt.subplots(1, 1, figsize=(10, 8))
     
-    # A. Real Data (Background)
+    # A. Real Data
     ax1.scatter(emb_real[:,0], emb_real[:,1], c=[c_real], s=15, alpha=0.15, label='Offline Data', rasterized=True)
     
     # B. Base Model
@@ -125,18 +132,18 @@ def visualize(args):
     plt.close(fig1)
 
     # ========================================================================
-    # FIGURE 2: DENSITY PLOT (Contours)
+    # FIGURE 2: DENSITY PLOT
     # ========================================================================
     print("Generating Figure 2: Density Plot...")
     fig2, ax2 = plt.subplots(1, 1, figsize=(10, 8))
     
-    # A. Real Data (Filled Terrain)
+    # A. Real Data
     sns.kdeplot(x=emb_real[:,0], y=emb_real[:,1], levels=6, color=c_real, fill=True, alpha=0.2, ax=ax2, thresh=0.05)
     
-    # B. Base Model (Solid Lines)
+    # B. Base Model
     sns.kdeplot(x=emb_base[:,0], y=emb_base[:,1], levels=4, color=c_base, linewidths=2.5, ax=ax2, thresh=0.05)
     
-    # C. S-MEME (Dashed Lines + Stronger Width)
+    # C. S-MEME
     sns.kdeplot(x=emb_smeme[:,0], y=emb_smeme[:,1], levels=4, color=c_smeme, linewidths=3.0, linestyles='--', ax=ax2, thresh=0.05)
     
     ax2.set_title(f"Manifold Density: {args.dataset}", fontweight='bold', pad=15)
@@ -160,7 +167,6 @@ def visualize(args):
     print("\n✅ Success! Generated 'manifold_scatter.pdf' and 'manifold_density.pdf'")
 
 if __name__ == "__main__":
-    # Globals for pickling
     sys.modules['__main__'].SMEMEConfig = SMEMEConfig
     sys.modules['__main__'].AdjointMatchingConfig = AdjointMatchingConfig
 
@@ -168,7 +174,11 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--base_checkpoint', type=str, required=True)
     parser.add_argument('--smeme_checkpoint', type=str, required=True)
+    
+    # New Argument
+    parser.add_argument('--num_inference_steps', type=int, default=64, help="Number of diffusion sampling steps")
     parser.add_argument('--num_points', type=int, default=3000, help="Points per model")
+    
     parser.add_argument('--gin_config_files', nargs='*', default=['config/resmlp_denoiser.gin'])
     parser.add_argument('--gin_params', nargs='*', default=[])
     
