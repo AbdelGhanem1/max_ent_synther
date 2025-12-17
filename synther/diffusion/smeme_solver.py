@@ -55,7 +55,7 @@ class SMEMESolver:
             # Limit sigma to >= 0.05 to prevent explosion
             safe_sigma = torch.maximum(sigma, torch.tensor(0.05, device=x_data.device))
             
-            score = eps / safe_sigma
+            score = -eps / safe_sigma
             
             # [SAFETY CLAMP] Cap the score magnitude to prevent infinite gradients
             # A score of 100 corresponds to a massive force. 
