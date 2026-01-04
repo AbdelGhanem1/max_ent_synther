@@ -37,10 +37,17 @@ smeme_module.VectorFieldAdjointSolver = DebugSolver
 def get_device(): return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def generate_unbalanced_data(n_samples=10000):
-    n_a = int(0.95 * n_samples)
-    n_b = n_samples - n_a
-    data_a = np.random.normal(loc=[5.0, 5.0], scale=1.5, size=(n_a, 2))
-    data_b = np.random.normal(loc=[-5.0, -5.0], scale=1.0, size=(n_b, 2))
+    n_mode_a = int(0.95 * n_samples)
+    n_mode_b = n_samples - n_mode_a
+    
+    # Mode A (Common): Large, at (3, 3)
+    data_a = np.random.normal(loc=[3.0, 3.0], scale=1.5, size=(n_mode_a, 2))
+    
+    # Mode B (Rare): Small, at (-1, -1) <-- MOVED CLOSER
+    # Now the distance is ~5.6 (approx 3.5 sigmas). 
+    # This creates a "bridge" the gradient can follow!
+    data_b = np.random.normal(loc=[-1.0, -1.0], scale=0.5, size=(n_mode_b, 2))
+    
     return np.vstack([data_a, data_b]).astype(np.float32)
 
 def plot_density(samples, title, ax, color, limits=((-10, 10), (-10, 10))):
