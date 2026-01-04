@@ -108,15 +108,29 @@ def run_experiment(schedule_name, alphas, base_model, raw_data, device):
     def noise_gen():
         while True: yield torch.randn(batch_size, 2).to(device)
         
+    # --- FIX START ---
     class Loader:
-        def __init__(self): self.g = noise_gen()
-        def __iter__(self): return self
-        def __next__(self): return next(self.g)
-        def __len__(self): return 500 # Steps per iter
+        def __init__(self, limit=500): 
+            self.g = noise_gen()
+            self.limit = limit
+            self.cnt = 0
+            
+        def __iter__(self): 
+            self.cnt = 0
+            return self
+            
+        def __next__(self): 
+            # Stop iteration after 'limit' steps so the solver finishes
+            if self.cnt >= self.limit: raise StopIteration
+            self.cnt += 1
+            return next(self.g)
+            
+        def __len__(self): return self.limit
         
-    # Run
-    # We use a custom loop to limit steps cleanly
-    finetuned = solver.train(tqdm(range(500), desc="Training")) # Iterate 500 times
+    # Pass the DATA LOADER, not a range!
+    loader = Loader(limit=500) 
+    finetuned = solver.train(loader) 
+    # --- FIX END ---
     
     # Generate Samples
     print("   Sampling results...")
@@ -125,7 +139,6 @@ def run_experiment(schedule_name, alphas, base_model, raw_data, device):
         samples = finetuned.model.sample(batch_size=2000).cpu().numpy()
         
     return samples
-
 # ============================================================================
 # 4. MAIN
 # ============================================================================
