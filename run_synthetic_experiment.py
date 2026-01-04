@@ -131,9 +131,14 @@ if __name__ == "__main__":
     )
     
     # In Dry Run, we do 1 iteration. In Full Run, we do 3.
-    smeme_iterations = 1 if args.dry_run else 3
-    alpha_schedule = (1.0,) if args.dry_run else (1.0, 0.5, 0.1)
+    if args.dry_run:
+        smeme_iterations = 1
+        alpha_schedule = (1.0,)
+    else:
+        smeme_iterations = 3
+        alpha_schedule = (1.0, 0.9, 0.8) # <--- CHANGED FROM (1.0, 0.5, 0.1)
 
+        
     smeme_config = SMEMEConfig(
         num_smeme_iterations=smeme_iterations,
         alpha_schedule=alpha_schedule,
