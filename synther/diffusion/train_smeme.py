@@ -46,73 +46,77 @@ class SMEMEConfig:
     am_config: AdjointMatchingConfig = field(default_factory=AdjointMatchingConfig)
 
 
-class DiffusionModelAdapter(nn.Module):
+
+
+
+
+def get_karras_sigmas(num_train_timesteps=1000, sigma_min=0.002, sigma_max=80.0, rho=7.0, device='cpu'):
     """
-    CRITICAL ADAPTER: Bridges the gap between Adjoint Matching (DDPM-style)
-    and Elucidated Diffusion (EDM/Karras-style).
+    Constructs the noise schedule of Karras et al. (2022).
+    Taken from diffusers.schedulers.scheduling_euler_discrete.EDMEulerScheduler
+    """
+    # 1. Create a ramp from 0 to 1
+    ramp = torch.linspace(0, 1, num_train_timesteps, device=device)
     
-    1. Translates Solver Time (t_idx) -> Adjoint Matching Sigma -> Model Input.
-    2. Translates Model Output (Denoised X) -> Noise Prediction (Epsilon).
-    """
-    def __init__(self, elucidated_model: ElucidatedDiffusion, solver_config: AdjointMatchingConfig):
+    # 2. Apply the Karras formula (the "conversion" logic)
+    min_inv_rho = sigma_min ** (1 / rho)
+    max_inv_rho = sigma_max ** (1 / rho)
+    sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+    
+    # 3. Invert it so it goes from Sigma_Max (Noise) -> Sigma_Min (Clean)
+    # This matches the expectation that t=0 is high noise in some solvers, 
+    # or you can index it t=1000 -> 0.
+    return sigmas
+
+
+
+class DiffusionModelAdapter(nn.Module):
+    def __init__(self, elucidated_model, solver_config):
         super().__init__()
         self.model = elucidated_model
         self.config = solver_config
         
-        # We need the EXACT sigma schedule used by the solver to ensure consistency.
-        # sigma(t) = sqrt( 2(1 - t + h) / (t + h) ) [Paper Eq 235]
-        self.h = 1.0 / self.config.num_inference_steps
+        # 1. Generate the Karras Schedule (High Noise -> Low Noise)
+        # Parameters (0.002, 80.0, 7.0) must match your pre-trained model!
+        sigma_min = 0.002
+        sigma_max = 80.0
+        rho = 7.0
+        
+        ramp = torch.linspace(0, 1, self.config.num_train_timesteps)
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        
+        # This creates [80.0, ...., 0.002]
+        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+        
+        # 2. [CRITICAL FIX] Flip the array to align with DDPM Solver
+        # Solver expects t=1000 to be High Noise.
+        # We want sigmas[1000] = 80.0
+        # So we flip: [0.002, ..., 80.0]
+        self.register_buffer('sigmas', torch.flip(sigmas, [0]))
 
     def get_sigma_at_step(self, t_idx_tensor):
         """
-        Calculates sigma for a given integer timestep index k.
+        Translates solver index t (e.g. 999) -> Exact Sigma (e.g. 80.0).
         """
-        # [MODIFICATION] Invert the time axis!
-        # Original (WRONG): t_continuous = t_idx_tensor.float() / self.config.num_train_timesteps
-        #
-        # Explanation:
-        # The Solver counts DOWN from 1000 -> 0.
-        # We want Sigma to go from High -> Low.
-        # The formula sqrt(2(1-t+h)/(t+h)) gives High Sigma when t is roughly 0.
-        # So we map 1000 -> 0.0 and 0 -> 1.0.
+        # Safety clamp to ensure we don't index out of bounds
+        t_idx_tensor = t_idx_tensor.long().clamp(0, len(self.sigmas) - 1)
         
-        # 1. Normalize 1000 -> 1.0
-        norm_t = t_idx_tensor.float() / self.config.num_train_timesteps
-        
-        # 2. Invert so Start(1000) becomes 0.0 (High Sigma)
-        t_continuous = 1.0 - norm_t
-        
-        # 3. Apply formula
-        numerator = 2 * (1 - t_continuous + self.h)
-        denominator = t_continuous + self.h
-        sigma = torch.sqrt(numerator / denominator)
-        return sigma
+        # Direct lookup (because we flipped the table in __init__)
+        return self.sigmas[t_idx_tensor]
 
     def forward(self, x, t_idx, prompt_emb=None):
-        """
-        Args:
-            x: Noisy input (Batch, Dim)
-            t_idx: Timestep indices (Batch,)
-        Returns:
-            pred_epsilon: Estimated noise (Batch, Dim)
-        """
-        # 1. Calculate the sigma mandated by Adjoint Matching physics
+        # 1. Get sigma
         sigmas = self.get_sigma_at_step(t_idx)
-        
-        # 2. Reshape for broadcasting
         sigmas = sigmas.view(x.shape[0])
         
-        # 3. Forward pass through Pre-trained EDM Model
-        # ElucidatedDiffusion.preconditioned_network_forward outputs D(x, sigma) (Denoised data)
+        # 2. Run Model (Denoising)
         denoised_x = self.model.preconditioned_network_forward(x, sigmas, clamp=False)
         
-        # 4. Convert Denoised Data -> Epsilon
+        # 3. Convert to Epsilon (Standard reparameterization)
         # x = data + sigma * epsilon  =>  epsilon = (x - data) / sigma
-        
-        # Reshape sigma for broadcasting against x
         sigmas_broad = sigmas.view(-1, *([1] * (x.ndim - 1)))
-        
-        pred_epsilon = (x - denoised_x) / (sigmas_broad + 1e-5) # Stability epsilon
+        pred_epsilon = (x - denoised_x) / (sigmas_broad + 1e-5)
         
         return pred_epsilon
 

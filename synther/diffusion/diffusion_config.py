@@ -17,10 +17,6 @@ from synther.diffusion.denoiser_network import ResidualMLPDenoiser
 from synther.diffusion.elucidated_diffusion import ElucidatedDiffusion
 from synther.diffusion.norm import normalizer_factory
 
-from synther.diffusion.diffusion_config import edm_global_config
-
-
-
 
 # Make transition dataset from data.
 @gin.configurable
@@ -104,14 +100,7 @@ def construct_diffusion_model(
     normalizer = normalizer_factory(normalizer_type, inputs, skip_dims=skip_dims)
 
     return ElucidatedDiffusion(
-            net=model,
-            normalizer=normalizer,
-            event_shape=[event_dim],
-            # Enforce consistency:
-            sigma_min=edm_global_config.sigma_min,
-            sigma_max=edm_global_config.sigma_max,
-            sigma_data=edm_global_config.sigma_data,
-            rho=edm_global_config.rho,
-            P_mean=edm_global_config.P_mean,
-            P_std=edm_global_config.P_std,
-        )
+        net=model,
+        normalizer=normalizer,
+        event_shape=[event_dim],
+    )
