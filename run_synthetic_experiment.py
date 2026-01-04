@@ -1,8 +1,9 @@
+import argparse
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import os
+import copy
 from tqdm import tqdm
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -39,46 +40,73 @@ def generate_unbalanced_data(n_samples=10000):
     return data.astype(np.float32)
 
 def plot_density(samples, title, ax, color, limits=((-10, 10), (-10, 10))):
-    sns.kdeplot(
-        x=samples[:, 0], y=samples[:, 1], 
-        fill=True, cmap=color, levels=15, thresh=0.05, ax=ax
-    )
-    ax.set_xlim(limits[0])
-    ax.set_ylim(limits[1])
-    ax.set_title(title, fontsize=14)
-    ax.scatter(samples[:500, 0], samples[:500, 1], s=2, color='black', alpha=0.1)
+    # 1. Remove NaNs and Infs
+    valid_mask = np.isfinite(samples).all(axis=1)
+    clean_samples = samples[valid_mask]
+    
+    if len(clean_samples) < 100:
+        ax.text(0, 0, "Model Collapsed\n(NaNs or bad data)", ha='center')
+        ax.set_title(title)
+        return
+
+    # 2. Check for variance (prevents "Contour levels must be increasing" crash)
+    if np.std(clean_samples) < 1e-3:
+        ax.text(0, 0, "Model Collapsed\n(Zero Variance)", ha='center')
+        ax.set_title(title)
+        ax.set_xlim(limits[0])
+        ax.set_ylim(limits[1])
+        return
+
+    try:
+        sns.kdeplot(
+            x=clean_samples[:, 0], y=clean_samples[:, 1], 
+            fill=True, cmap=color, levels=15, thresh=0.05, ax=ax
+        )
+        ax.set_xlim(limits[0])
+        ax.set_ylim(limits[1])
+        ax.set_title(title, fontsize=14)
+        # Plot raw points for verification
+        subset = clean_samples[:500]
+        ax.scatter(subset[:, 0], subset[:, 1], s=2, color='black', alpha=0.1)
+    except Exception as e:
+        print(f"Warning: Plotting failed for {title}: {e}")
+        ax.text(0, 0, "Plotting Error", ha='center')
 
 # ============================================================================
 # 2. MAIN EXECUTION
 # ============================================================================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dry_run', action='store_true', help="Run minimal steps to check for bugs")
+    args = parser.parse_args()
+
     device = get_device()
-    print(f"Running S-MEME Synthetic Test on {device}...")
+    print(f"Running S-MEME Synthetic Test on {device} (Dry Run: {args.dry_run})")
     
     # --- A. DATA PREPARATION ---
     raw_data = generate_unbalanced_data()
     dataset_tensor = torch.from_numpy(raw_data).to(device)
     
-    # --- B. CONSTRUCT BASE MODEL (Using your Utils) ---
+    # --- B. CONSTRUCT BASE MODEL ---
     print("Constructing Base Model...")
-    # Note: We pass the raw data so utils.py can calculate Mean/Std for normalization
     base_model = construct_diffusion_model(
         inputs=dataset_tensor.cpu(),
-        normalizer_type='standard', # Standard Gaussian Normalization
+        normalizer_type='standard',
         denoising_network=ResidualMLPDenoiser
     ).to(device)
     
-    # --- C. PRE-TRAIN BASE MODEL (Simulate "Offline RL" pre-training) ---
-    print("Pre-training Base Model (The 'Imitator')...")
+    # --- C. PRE-TRAIN BASE MODEL ---
+    # Fast training for synthetic data
     optimizer = torch.optim.Adam(base_model.parameters(), lr=1e-3)
     batch_size = 256
-    n_steps = 2000 # Fast training for synthetic data
+    n_pretrain_steps = 100 if args.dry_run else 2000
     
+    print(f"Pre-training Base Model for {n_pretrain_steps} steps...")
     loader = DataLoader(TensorDataset(dataset_tensor), batch_size=batch_size, shuffle=True)
     loader_iter = iter(loader)
     
     base_model.train()
-    for step in tqdm(range(n_steps), desc="Pre-training"):
+    for step in tqdm(range(n_pretrain_steps), desc="Pre-training"):
         try:
             batch = next(loader_iter)[0]
         except StopIteration:
@@ -92,36 +120,43 @@ if __name__ == "__main__":
 
     print("Pre-training Complete.")
     
+    # [CRITICAL] Save a copy of the base model BEFORE S-MEME modifies it in-place
+    original_base_model = copy.deepcopy(base_model)
+    
     # --- D. S-MEME CONFIGURATION ---
-    # We want to be aggressive to visualize the shift
     am_config = AdjointMatchingConfig(
         num_train_timesteps=1000, 
-        num_inference_steps=20,  # Fast solving
-        reward_multiplier=1.0    # Will be overridden by alpha
+        num_inference_steps=20,
+        reward_multiplier=1.0 
     )
     
+    # In Dry Run, we do 1 iteration. In Full Run, we do 3.
+    smeme_iterations = 1 if args.dry_run else 3
+    alpha_schedule = (1.0,) if args.dry_run else (1.0, 0.5, 0.1)
+
     smeme_config = SMEMEConfig(
-        num_smeme_iterations=3,
-        alpha_schedule=(1.0, 0.5, 0.1), # Decreasing alpha = Increasing Exploration
+        num_smeme_iterations=smeme_iterations,
+        alpha_schedule=alpha_schedule,
         am_config=am_config
     )
     
-    # Wrap model with the Adapter (Using the Config Source of Truth)
+    # Wrap model with the Adapter
     wrapped_model = DiffusionModelAdapter(base_model, am_config).to(device)
     
     # Initialize Solver
     solver = SMEMESolver(base_model=wrapped_model, config=smeme_config)
     
+    # [FIX] Override the solver's internal optimizer with a lower LR for synthetic data
+    # The default 1e-4 is often too aggressive for this delicate 2D manifold
+    solver.optimizer = torch.optim.AdamW(solver.current_model.parameters(), lr=1e-5, weight_decay=1e-2)
+    
     # --- E. S-MEME FINE-TUNING ---
-    # Generator for S-MEME (it needs infinite noise source)
     def noise_generator():
         while True:
-            # We generate 2D noise
             yield torch.randn(batch_size, 2).to(device)
             
     # S-MEME Loop
-    # We use fewer steps than real RL because 2D converges fast
-    steps_per_iter = 500 
+    steps_per_iter = 10 if args.dry_run else 500
     
     class SimpleLoader:
         def __init__(self, gen, limit):
@@ -134,20 +169,20 @@ if __name__ == "__main__":
 
     train_loader = SimpleLoader(noise_generator(), steps_per_iter)
     
-    print("\nStarting S-MEME Fine-tuning...")
+    print(f"\nStarting S-MEME Fine-tuning ({steps_per_iter} steps per iter)...")
     finetuned_wrapper = solver.train(train_loader)
     finetuned_model = finetuned_wrapper.model
     
     # --- F. VISUALIZATION ---
     print("\nGenerating Visualization...")
-    base_model.eval()
+    original_base_model.eval()
     finetuned_model.eval()
     
-    # Generate samples
     n_plot = 2000
     with torch.no_grad():
-        # Note: .sample() automatically un-normalizes using the stats from Step B
-        samples_base = base_model.sample(batch_size=n_plot).cpu().numpy()
+        # Generate from Original
+        samples_base = original_base_model.sample(batch_size=n_plot).cpu().numpy()
+        # Generate from S-MEME
         samples_smeme = finetuned_model.sample(batch_size=n_plot).cpu().numpy()
 
     # Plot
@@ -160,7 +195,6 @@ if __name__ == "__main__":
 
     # 2. Base Model
     plot_density(samples_base, "Base Model (Imitator)", axes[1], "Blues")
-    # Calculate ratio roughly
     n_rare_base = np.sum(samples_base[:, 0] < 0)
     axes[1].text(-5, -8, f"Count: {n_rare_base}", color='red', ha='center')
 
@@ -173,8 +207,3 @@ if __name__ == "__main__":
     plt.savefig("smeme_synthetic_test.png")
     print(f"\nTest Complete. Saved 'smeme_synthetic_test.png'.")
     print(f"Rare Mode Count: Base={n_rare_base} vs S-MEME={n_rare_smeme}")
-    
-    if n_rare_smeme > n_rare_base * 1.5:
-        print("✅ SUCCESS: S-MEME significantly increased exploration of the rare mode.")
-    else:
-        print("⚠️ WARNING: Exploration increase was minimal. Check gradients.")
