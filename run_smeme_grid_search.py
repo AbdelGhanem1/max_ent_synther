@@ -60,9 +60,9 @@ def run_evolution_experiment(alphas, base_model, device):
     print(f"\n>>> TRACKING EVOLUTION | Alphas: {alphas}")
     
     current_model = copy.deepcopy(base_model)
-    history = [] # Store samples at each step
+    history = [] 
     
-    # Initial State
+    # Initial State Snapshot
     current_model.eval()
     with torch.no_grad():
         history.append(current_model.sample(batch_size=2000).cpu().numpy())
@@ -70,7 +70,6 @@ def run_evolution_experiment(alphas, base_model, device):
     # Config
     am_config = AdjointMatchingConfig(num_train_timesteps=1000, num_inference_steps=20, reward_multiplier=1.0)
     
-    # We run the loop MANUALLY to save snapshots
     batch_size = 256
     def noise_gen():
         while True: yield torch.randn(batch_size, 2).to(device)
@@ -83,36 +82,35 @@ def run_evolution_experiment(alphas, base_model, device):
             self.cnt+=1; return next(self.g)
         def __len__(self): return 500
 
-    prev_model = copy.deepcopy(current_model) # Init previous model
+    prev_model = copy.deepcopy(current_model) 
     prev_model.requires_grad_(False)
 
     for k, alpha in enumerate(alphas):
         print(f"   Iteration {k+1}/{len(alphas)} (Alpha={alpha})")
         
-        # Setup specific config for this step
-        am_config.reward_multiplier = 1.0 / alpha  # Multiplier logic
+        am_config.reward_multiplier = 1.0 / alpha
         
-        # Wrap
-        wrapped = DiffusionModelAdapter(current_model, am_config).to(device)
+        # [CRITICAL FIX] Wrap BOTH models so they speak "Epsilon" not "Loss"
+        wrapped_fine = DiffusionModelAdapter(current_model, am_config).to(device)
+        wrapped_pre = DiffusionModelAdapter(prev_model, am_config).to(device)
         
-        # Init Solver manually to control the loop
+        # Init Solver with WRAPPED models
         solver = smeme_module.VectorFieldAdjointSolver(
-            model_pre=prev_model, # Use frozen previous model
-            model_fine=wrapped,   # Update current model
+            model_pre=wrapped_pre, 
+            model_fine=wrapped_fine,   
             config=am_config
         )
         
-        # Define Reward (Entropy)
-        # Note: We create a fresh SMEMESolver instance just to use its helper methods if needed,
-        # or we just define the gradient function here.
-        smeme_helper = smeme_module.SMEMESolver(current_model, SMEMEConfig()) # Dummy config
-        smeme_helper.previous_model = prev_model # Important!
+        # Helper for Score (Gradient)
+        # We use a dummy SMEMESolver just to access _get_score_at_data
+        smeme_helper = smeme_module.SMEMESolver(wrapped_fine, SMEMEConfig())
         
         def entropy_grad(x, t):
-            return smeme_helper._get_score_at_data(prev_model, x, t)
+            # Calculate score using the WRAPPED previous model
+            return smeme_helper._get_score_at_data(wrapped_pre, x, t)
 
         # Train Loop
-        opt = torch.optim.AdamW(current_model.parameters(), lr=1e-5) # Safer LR
+        opt = torch.optim.AdamW(current_model.parameters(), lr=1e-5)
         loader = Loader()
         
         current_model.train()
