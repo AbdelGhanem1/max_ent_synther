@@ -24,6 +24,7 @@ from synther.diffusion.train_diffuser import SimpleDiffusionGenerator
 # Ensure these files exist in synther/diffusion/
 from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
 from synther.diffusion.smeme_solver import SMEMESolver
+from synther.diffusion.diffusion_config import edm_global_config
 
 @gin.configurable
 @dataclass
@@ -71,38 +72,40 @@ def get_karras_sigmas(num_train_timesteps=1000, sigma_min=0.002, sigma_max=80.0,
 
 
 class DiffusionModelAdapter(nn.Module):
-    def __init__(self, elucidated_model, solver_config):
+    def __init__(self, elucidated_model: ElucidatedDiffusion, solver_config: AdjointMatchingConfig):
         super().__init__()
         self.model = elucidated_model
         self.config = solver_config
         
-        # 1. Generate the Karras Schedule (High Noise -> Low Noise)
-        # Parameters (0.002, 80.0, 7.0) must match your pre-trained model!
-        sigma_min = 0.002
-        sigma_max = 80.0
-        rho = 7.0
+        # --- ROBUST KARRAS SCHEDULE GENERATION ---
+        # We use the Global Config to ensure we match the pre-trained model perfectly.
         
+        # 1. Create the ramp (0 to 1)
+        # Note: We use num_train_timesteps from the SOLVER config (e.g. 1000)
         ramp = torch.linspace(0, 1, self.config.num_train_timesteps)
+        
+        # 2. Get Physics Parameters from Source of Truth
+        sigma_min = edm_global_config.sigma_min
+        sigma_max = edm_global_config.sigma_max
+        rho = edm_global_config.rho
+        
+        # 3. Apply Karras Formula (Equation 5 in paper)
         min_inv_rho = sigma_min ** (1 / rho)
         max_inv_rho = sigma_max ** (1 / rho)
-        
-        # This creates [80.0, ...., 0.002]
         sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
         
-        # 2. [CRITICAL FIX] Flip the array to align with DDPM Solver
-        # Solver expects t=1000 to be High Noise.
-        # We want sigmas[1000] = 80.0
-        # So we flip: [0.002, ..., 80.0]
+        # 4. [CRITICAL] Flip to match Solver Direction
+        # Solver: t=1000 (Start) -> t=0 (End)
+        # Array:  Index 0 (Max Sigma) -> Index 1000 (Min Sigma)
+        # We flip so Index 1000 contains Max Sigma.
         self.register_buffer('sigmas', torch.flip(sigmas, [0]))
-
+        
     def get_sigma_at_step(self, t_idx_tensor):
         """
         Translates solver index t (e.g. 999) -> Exact Sigma (e.g. 80.0).
         """
-        # Safety clamp to ensure we don't index out of bounds
+        # Clamp for safety
         t_idx_tensor = t_idx_tensor.long().clamp(0, len(self.sigmas) - 1)
-        
-        # Direct lookup (because we flipped the table in __init__)
         return self.sigmas[t_idx_tensor]
 
     def forward(self, x, t_idx, prompt_emb=None):
@@ -113,8 +116,7 @@ class DiffusionModelAdapter(nn.Module):
         # 2. Run Model (Denoising)
         denoised_x = self.model.preconditioned_network_forward(x, sigmas, clamp=False)
         
-        # 3. Convert to Epsilon (Standard reparameterization)
-        # x = data + sigma * epsilon  =>  epsilon = (x - data) / sigma
+        # 3. Convert to Epsilon
         sigmas_broad = sigmas.view(-1, *([1] * (x.ndim - 1)))
         pred_epsilon = (x - denoised_x) / (sigmas_broad + 1e-5)
         
