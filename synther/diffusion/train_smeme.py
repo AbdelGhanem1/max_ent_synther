@@ -17,11 +17,9 @@ from synther.diffusion.elucidated_diffusion import ElucidatedDiffusion
 from just_d4rl import d4rl_offline_dataset
 
 # FIX: Import SimpleDiffusionGenerator to register it with GIN
-# This prevents the "No configurable matching 'SimpleDiffusionGenerator'" error
 from synther.diffusion.train_diffuser import SimpleDiffusionGenerator
 
-# The SOTA Solvers we built
-# Ensure these files exist in synther/diffusion/
+# The SOTA Solvers
 from synther.diffusion.adjoint_matching_solver import AdjointMatchingSolver
 from synther.diffusion.smeme_solver import SMEMESolver
 from synther.diffusion.diffusion_config import edm_global_config
@@ -31,7 +29,7 @@ from synther.diffusion.diffusion_config import edm_global_config
 class AdjointMatchingConfig:
     """Configuration corresponding to Paper Appendix H details"""
     num_train_timesteps: int = 1000      # Discretization of the ODE
-    num_inference_steps: int = 20        # K in the paper (step size h = 1/K)
+    num_inference_steps: int = 20        # K in the paper
     num_timesteps_to_load: int = 40      # Batch size for stratified sampling
     per_sample_threshold_quantile: float = 0.9 # For EMA clipping
     reward_multiplier: float = 1.0       # Will be overwritten by 1/alpha
@@ -41,35 +39,8 @@ class AdjointMatchingConfig:
 class SMEMEConfig:
     num_smeme_iterations: int = 3
     # Decreasing regularization schedule (Alpha)
-    # High alpha = close to base model. Low alpha = maximize entropy.
     alpha_schedule: tuple = (1.0, 0.5, 0.1) 
-    # Use default_factory for mutable defaults
     am_config: AdjointMatchingConfig = field(default_factory=AdjointMatchingConfig)
-
-
-
-
-
-
-def get_karras_sigmas(num_train_timesteps=1000, sigma_min=0.002, sigma_max=80.0, rho=7.0, device='cpu'):
-    """
-    Constructs the noise schedule of Karras et al. (2022).
-    Taken from diffusers.schedulers.scheduling_euler_discrete.EDMEulerScheduler
-    """
-    # 1. Create a ramp from 0 to 1
-    ramp = torch.linspace(0, 1, num_train_timesteps, device=device)
-    
-    # 2. Apply the Karras formula (the "conversion" logic)
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
-    
-    # 3. Invert it so it goes from Sigma_Max (Noise) -> Sigma_Min (Clean)
-    # This matches the expectation that t=0 is high noise in some solvers, 
-    # or you can index it t=1000 -> 0.
-    return sigmas
-
-
 
 class DiffusionModelAdapter(nn.Module):
     def __init__(self, elucidated_model: ElucidatedDiffusion, solver_config: AdjointMatchingConfig):
@@ -78,10 +49,7 @@ class DiffusionModelAdapter(nn.Module):
         self.config = solver_config
         
         # --- ROBUST KARRAS SCHEDULE GENERATION ---
-        # We use the Global Config to ensure we match the pre-trained model perfectly.
-        
         # 1. Create the ramp (0 to 1)
-        # Note: We use num_train_timesteps from the SOLVER config (e.g. 1000)
         ramp = torch.linspace(0, 1, self.config.num_train_timesteps)
         
         # 2. Get Physics Parameters from Source of Truth
@@ -89,7 +57,7 @@ class DiffusionModelAdapter(nn.Module):
         sigma_max = edm_global_config.sigma_max
         rho = edm_global_config.rho
         
-        # 3. Apply Karras Formula (Equation 5 in paper)
+        # 3. Apply Karras Formula
         min_inv_rho = sigma_min ** (1 / rho)
         max_inv_rho = sigma_max ** (1 / rho)
         sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
@@ -140,7 +108,7 @@ if __name__ == '__main__':
     parser.add_argument('--gin_params', nargs='*', type=str, default=[])
     parser.add_argument('--seed', type=int, default=0)
     
-    # WANDB args (optional compatibility)
+    # WANDB args
     parser.add_argument('--wandb-project', type=str, default="smeme-finetuning")
     
     args = parser.parse_args()
@@ -154,7 +122,7 @@ if __name__ == '__main__':
     results_folder = pathlib.Path(args.results_folder)
     results_folder.mkdir(parents=True, exist_ok=True)
 
-    # 2. Data Loading (For shape and normalization context)
+    # 2. Data Loading
     print(f"Loading dataset info for {args.dataset}...")
     d4rl_dataset = d4rl_offline_dataset(args.dataset)
     obs = d4rl_dataset['observations']
@@ -163,15 +131,12 @@ if __name__ == '__main__':
     term = d4rl_dataset['terminals'][:, None] if len(d4rl_dataset['terminals'].shape) == 1 else d4rl_dataset['terminals']
     next_obs = d4rl_dataset['next_observations']
     
-    # Concatenate to determine input dimension
     inputs_np = np.concatenate([obs, act, rew, next_obs, term], axis=1)
     input_dim = inputs_np.shape[1]
     print(f"Data Dimension: {input_dim}")
 
     # 3. Model Construction & Loading
     full_dataset_tensor = torch.from_numpy(inputs_np).float()
-    
-    # Construct model using real data stats
     base_model_edm = construct_diffusion_model(inputs=full_dataset_tensor)
     
     print(f"Loading weights from {args.load_checkpoint}...")
@@ -180,9 +145,9 @@ if __name__ == '__main__':
     
     base_model_edm.load_state_dict(state_dict)
     base_model_edm.to(device)
-    base_model_edm.eval() # Freeze stats
+    base_model_edm.eval() 
 
-    # 4. Wrap the Model for Adjoint Matching
+    # 4. Wrap the Model
     am_config = AdjointMatchingConfig()
     wrapped_model = DiffusionModelAdapter(base_model_edm, am_config).to(device)
     
@@ -196,13 +161,15 @@ if __name__ == '__main__':
     # 6. Initialize Solver
     solver = SMEMESolver(base_model=wrapped_model, config=smeme_config)
     
-    # 7. Training Loop Generator
+    # [CRITICAL FIX] Override Optimizer with Lower LR for Stability
+    # The default 1e-4 causes explosions on delicate manifolds. 1e-5 is safer.
+    solver.optimizer = torch.optim.AdamW(solver.current_model.parameters(), lr=1e-5, weight_decay=1e-2)
+    
+    # 7. Training
     def noise_generator():
         while True:
             yield torch.randn(args.batch_size, input_dim).to(device)
             
-    # Simple iterator wrapper
-    # Simple iterator wrapper
     class InfiniteNoiseLoader:
         def __init__(self, generator, limit):
             self.gen = generator
@@ -210,7 +177,6 @@ if __name__ == '__main__':
             self.cnt = 0
             
         def __iter__(self):
-            # FIX: Reset counter when a new loop starts
             self.cnt = 0
             return self
             
@@ -229,7 +195,7 @@ if __name__ == '__main__':
     finetuned_wrapper = solver.train(train_loader)
     
     # 8. Save Results
-    # FIX: The wrapper IS the model interface. The underlying EDM is in .model
+    # FIX: Save the underlying EDM, not the wrapper
     finetuned_edm = finetuned_wrapper.model 
     
     save_path = results_folder / "smeme_finetuned.pt"
