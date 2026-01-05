@@ -6,160 +6,178 @@ import copy
 from tqdm import tqdm
 from torch.utils.data import DataLoader, TensorDataset
 
-# --- MODULE IMPORTS ---
+# --- IMPORTS ---
 from synther.diffusion.utils import construct_diffusion_model
 from synther.diffusion.denoiser_network import ResidualMLPDenoiser
 from synther.diffusion.train_smeme import SMEMEConfig, AdjointMatchingConfig, DiffusionModelAdapter
 import synther.diffusion.smeme_solver as smeme_module
 
-# ============================================================================
-# 1. SETUP: YOUR PROPOSED 70/30 EXPERIMENT
-# ============================================================================
 def get_device(): return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+# ============================================================================
+# 1. ROBUST DATA GENERATION (Far Apart 70/30)
+# ============================================================================
 def generate_unbalanced_data(n_samples=10000):
-    # Cluster A: 70% of data (High Density)
+    # Mode A: 70% at (-4, -4)
     n_a = int(0.70 * n_samples)
     data_a = np.random.normal(loc=[-4.0, -4.0], scale=1.0, size=(n_a, 2))
     
-    # Cluster B: 30% of data (Low Density)
+    # Mode B: 30% at (4, 4)
     n_b = n_samples - n_a
     data_b = np.random.normal(loc=[4.0, 4.0], scale=1.0, size=(n_b, 2))
     
     return np.vstack([data_a, data_b]).astype(np.float32)
 
 def check_balance(samples):
-    # Count how many samples fall into Cluster A vs Cluster B
-    # We use a simple distance check
-    
+    # Simple distance check
     dist_a = np.linalg.norm(samples - np.array([-4.0, -4.0]), axis=1)
     dist_b = np.linalg.norm(samples - np.array([4.0, 4.0]), axis=1)
     
-    count_a = np.sum(dist_a < 2.5) # Within 2.5 units of center A
-    count_b = np.sum(dist_b < 2.5) # Within 2.5 units of center B
+    count_a = np.sum(dist_a < 3.0) 
+    count_b = np.sum(dist_b < 3.0)
     
     total = len(samples)
-    ratio_a = count_a / total
-    ratio_b = count_b / total
-    
-    return ratio_a, ratio_b
+    return count_a / total, count_b / total
 
-def plot_results(base_samples, smeme_samples, title_suffix=""):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    
+def plot_final_comparison(base_samples, smeme_samples):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     limits = ((-8, 8), (-8, 8))
     
     # Base
-    sns.kdeplot(x=base_samples[:,0], y=base_samples[:,1], fill=True, cmap="Blues", ax=axes[0], levels=10)
-    axes[0].set_title(f"Base Model\n(Target: 70% A, 30% B)")
-    axes[0].set_xlim(limits[0]); axes[0].set_ylim(limits[1])
-    # Annotate
     ra, rb = check_balance(base_samples)
-    axes[0].text(-4, -4, f"{ra*100:.1f}%", ha='center', color='black', fontweight='bold')
-    axes[0].text(4, 4, f"{rb*100:.1f}%", ha='center', color='black', fontweight='bold')
+    sns.kdeplot(x=base_samples[:,0], y=base_samples[:,1], fill=True, cmap="Blues", ax=axes[0], levels=10)
+    axes[0].set_title(f"Base Model (Imitator)\nA: {ra*100:.1f}% | B: {rb*100:.1f}%")
+    axes[0].set_xlim(limits[0]); axes[0].set_ylim(limits[1])
+    axes[0].scatter([-4, 4], [-4, 4], marker='x', color='red', s=100, label='True Centers')
 
     # S-MEME
+    rsa, rsb = check_balance(smeme_samples)
     sns.kdeplot(x=smeme_samples[:,0], y=smeme_samples[:,1], fill=True, cmap="Oranges", ax=axes[1], levels=10)
-    axes[1].set_title(f"S-MEME Result\n(Expectation: ~50% / 50%)")
+    axes[1].set_title(f"S-MEME (Re-Balancer)\nA: {rsa*100:.1f}% | B: {rsb*100:.1f}%")
     axes[1].set_xlim(limits[0]); axes[1].set_ylim(limits[1])
-    # Annotate
-    ra_s, rb_s = check_balance(smeme_samples)
-    axes[1].text(-4, -4, f"{ra_s*100:.1f}%", ha='center', color='black', fontweight='bold')
-    axes[1].text(4, 4, f"{rb_s*100:.1f}%", ha='center', color='black', fontweight='bold')
+    axes[1].scatter([-4, 4], [-4, 4], marker='x', color='red', s=100)
 
     plt.tight_layout()
-    plt.savefig(f"smeme_unbalanced_experiment{title_suffix}.png")
-    print(f"Plot saved: smeme_unbalanced_experiment{title_suffix}.png")
+    plt.savefig("smeme_robust_result.png")
+    print("\nSaved plot to 'smeme_robust_result.png'")
 
 # ============================================================================
-# 2. EXPERIMENT RUNNER
+# 2. MAIN LOGIC
 # ============================================================================
-def run_experiment():
+if __name__ == "__main__":
     device = get_device()
-    print(">>> 1. Generating Data (70% vs 30%)...")
-    dataset = torch.from_numpy(generate_unbalanced_data()).to(device)
+    print(">>> Generating 70/30 Data...")
+    dataset_np = generate_unbalanced_data()
+    dataset = torch.from_numpy(dataset_np).to(device)
     
-    print(">>> 2. Training Base Model (Imitator)...")
-    base_model = construct_diffusion_model(inputs=dataset.cpu(), normalizer_type='standard', denoising_network=ResidualMLPDenoiser).to(device)
+    # --- STEP 1: FORCE BASE MODEL TO LEARN ---
+    print("\n>>> Constructing Base Model...")
+    # We stick to the default network but we will train it PROPERLY
+    base_model = construct_diffusion_model(
+        inputs=dataset.cpu(), 
+        normalizer_type='standard', 
+        denoising_network=ResidualMLPDenoiser
+    ).to(device)
+    
     opt = torch.optim.Adam(base_model.parameters(), lr=1e-3)
+    loader = DataLoader(TensorDataset(dataset), batch_size=512, shuffle=True)
     
-    # Train until it learns the distribution well
-    loader = DataLoader(TensorDataset(dataset), batch_size=256, shuffle=True)
-    base_model.train()
-    for _ in tqdm(range(3000)): 
-        batch = next(iter(loader))[0]
-        opt.zero_grad(); base_model(batch).backward(); opt.step()
-        
-    # Check Base Stats
-    base_model.eval()
-    with torch.no_grad():
-        base_samples = base_model.sample(batch_size=5000).cpu().numpy()
-        
-    r_a, r_b = check_balance(base_samples)
-    print(f"\n[Base Model Stats] Mode A: {r_a*100:.1f}% | Mode B: {r_b*100:.1f}%")
+    print("\n>>> Training Base Model (Target: Capture Mode B > 20%)...")
     
-    if r_b < 0.1:
-        print("WARNING: Base model failed to learn the rare mode. S-MEME will fail.")
-        # But we proceed anyway to see what happens.
+    # We loop until we pass the quality check
+    max_epochs = 100
+    steps_per_epoch = 500
+    
+    for epoch in range(max_epochs):
+        base_model.train()
+        loss_accum = 0
+        for _ in range(steps_per_epoch):
+            # Random sampling from dataset is faster than iterator overhead for small data
+            idx = torch.randint(0, len(dataset), (512,))
+            batch = dataset[idx]
+            
+            opt.zero_grad()
+            loss = base_model(batch)
+            loss.backward()
+            opt.step()
+            loss_accum += loss.item()
+            
+        # Quality Check
+        base_model.eval()
+        with torch.no_grad():
+            samples = base_model.sample(batch_size=2000).cpu().numpy()
         
-    print("\n>>> 3. Running S-MEME (Re-Balancer)...")
-    # Paper Schedule: start gentle (0.1) then increase
-    # alpha 10.0 -> mult 0.1
-    # alpha 5.0  -> mult 0.2
-    # alpha 2.0  -> mult 0.5
-    alphas = [10.0, 5.0, 2.0]
+        ra, rb = check_balance(samples)
+        print(f"   [Epoch {epoch+1}] Loss: {loss_accum/steps_per_epoch:.4f} | Mode A: {ra*100:.1f}% | Mode B: {rb*100:.1f}%")
+        
+        if rb > 0.20: # If we capture at least 20% of Mode B (Target is 30%), we are good
+            print(f">>> SUCCESS: Base model learned both modes (B={rb*100:.1f}%). Stopping pre-training.")
+            break
+            
+    if rb < 0.20:
+        print(">>> CRITICAL FAILURE: Base model failed to learn Mode B even after extensive training.")
+        print(">>> Exiting to avoid wasting time on S-MEME.")
+        exit()
+
+    # --- STEP 2: RUN S-MEME ---
+    print("\n>>> Running S-MEME (Paper Schedule)...")
+    # Using the exact paper schedule that worked for exploration
+    alphas = [10.0, 5.0, 2.0] # Multipliers: 0.1, 0.2, 0.5
     
     am_config = AdjointMatchingConfig(num_train_timesteps=1000, num_inference_steps=20)
     current_model = copy.deepcopy(base_model)
     prev_model = copy.deepcopy(current_model); prev_model.requires_grad_(False)
     
-    batch_size = 256
-    def noise_gen():
-        while True: yield torch.randn(batch_size, 2).to(device)
+    opt_s = torch.optim.AdamW(current_model.parameters(), lr=1e-5)
     
-    class Loader:
-        def __init__(self): self.g=noise_gen(); self.cnt=0
-        def __iter__(self): self.cnt=0; return self
-        def __next__(self):
-            if self.cnt >= 500: raise StopIteration
-            self.cnt+=1; return next(self.g)
-        def __len__(self): return 500
+    # Define Gradient Function
+    def get_entropy_grad(x, t, model_snapshot):
+        # We need a temporary wrapper to call _get_score_at_data
+        # This is a bit ugly but ensures we use the exact logic from smeme_solver.py
+        wrapper = DiffusionModelAdapter(model_snapshot, am_config).to(device)
+        helper = smeme_module.SMEMESolver(wrapper, SMEMEConfig())
+        
+        # We also need to wrap the input 'x' logic if needed, but _get_score_at_data handles it
+        # Actually, _get_score_at_data expects the 'model' arg to be the wrapper
+        return helper._get_score_at_data(wrapper, x, t)
 
     for k, alpha in enumerate(alphas):
-        print(f"   Iteration {k+1} (Alpha {alpha})...")
+        print(f"   S-MEME Iteration {k+1} (Alpha {alpha})...")
         am_config.reward_multiplier = 1.0 / alpha
         
-        # Wrap
-        wrapped_fine = DiffusionModelAdapter(current_model, am_config).to(device)
-        wrapped_pre = DiffusionModelAdapter(prev_model, am_config).to(device)
+        # We implement the training loop directly here to avoid Wrapper hell
+        # We must update the 'wrapped' models every iteration
+        wrapped_curr = DiffusionModelAdapter(current_model, am_config).to(device)
+        wrapped_prev = DiffusionModelAdapter(prev_model, am_config).to(device)
         
-        solver = smeme_module.VectorFieldAdjointSolver(model_pre=wrapped_pre, model_fine=wrapped_fine, config=am_config)
-        smeme_helper = smeme_module.SMEMESolver(wrapped_fine, SMEMEConfig())
-        def entropy_grad(x, t): return smeme_helper._get_score_at_data(wrapped_pre, x, t)
+        solver = smeme_module.VectorFieldAdjointSolver(model_pre=wrapped_prev, model_fine=wrapped_curr, config=am_config)
         
-        opt_s = torch.optim.AdamW(current_model.parameters(), lr=1e-5)
+        # Helper for gradient
+        helper_dummy = smeme_module.SMEMESolver(wrapped_curr, SMEMEConfig())
+        def entropy_grad(x, t): return helper_dummy._get_score_at_data(wrapped_prev, x, t)
+        
         current_model.train()
-        loader = Loader()
-        
-        for batch in tqdm(loader):
+        for _ in tqdm(range(500)):
+            noise = torch.randn(512, 2).to(device)
             opt_s.zero_grad()
-            loss = solver.solve_vector_field(batch, entropy_grad)
+            loss = solver.solve_vector_field(noise, entropy_grad)
             loss.backward()
             opt_s.step()
             
-        # Update Previous
+        # Update Previous Model
         prev_model.load_state_dict(current_model.state_dict())
         
-    # Check S-MEME Stats
+        # Quick check
+        current_model.eval()
+        with torch.no_grad():
+            s_check = current_model.sample(batch_size=1000).cpu().numpy()
+        ra, rb = check_balance(s_check)
+        print(f"      -> Current Balance: A={ra*100:.1f}% | B={rb*100:.1f}%")
+
+    # --- STEP 3: FINAL RESULTS ---
+    print("\n>>> Generating Final Plot...")
     current_model.eval()
     with torch.no_grad():
-        smeme_samples = current_model.sample(batch_size=5000).cpu().numpy()
+        final_samples = current_model.sample(batch_size=5000).cpu().numpy()
         
-    rs_a, rs_b = check_balance(smeme_samples)
-    print(f"\n[S-MEME Stats] Mode A: {rs_a*100:.1f}% | Mode B: {rs_b*100:.1f}%")
-    print(f"Change in Rare Mode B: {rs_b*100 - r_b*100:+.1f}%")
-    
-    plot_results(base_samples, smeme_samples)
-
-if __name__ == "__main__":
-    run_experiment()
+    plot_final_comparison(samples, final_samples) # 'samples' is from Base, 'final_samples' from S-MEME
