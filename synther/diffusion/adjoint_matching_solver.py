@@ -25,7 +25,6 @@ class AdjointMatchingSolver:
         self.solver = FlowMatchingSolver(num_inference_steps=config.num_inference_steps)
         
         # EMA for Quantile Clipping
-        # Initialize as None so we can set it lazily on the first batch
         self.ema_quantile = None
         self.ema_decay = 0.99
 
@@ -51,9 +50,8 @@ class AdjointMatchingSolver:
             with torch.no_grad():
                 v_fine = self.solver.get_velocity(self.model_fine, x_t, t_now)
             
-            # Sanity Check: If forward pass explodes, stop early
+            # Sanity Check
             if torch.isnan(v_fine).any() or v_fine.abs().max() > 1e4:
-                # Return dummy zero loss with grad to prevent crash, but no update
                 return torch.tensor(0.0, device=device, requires_grad=True)
 
             x_next = self.solver.step_euler(x_t, v_fine, dt)
@@ -62,15 +60,11 @@ class AdjointMatchingSolver:
             
         x_final = traj[-1]
         
-        # 2. Compute Reward Gradient (The Source)
-        # We calculate the gradient of the "Surprise" at the end of the trajectory
+        # 2. Compute Reward Gradient (Normalized)
         reward_grad = target_grad_fn(x_final)
-        
-        # Normalize the Reward Gradient to stabilize training
         grad_norm = torch.norm(reward_grad, dim=1, keepdim=True) + 1e-8
         reward_grad = reward_grad / grad_norm 
         
-        # Initial Adjoint State (lambda_T)
         lambda_t = -1.0 * reward_grad * self.config.reward_multiplier
         
         # 3. Backward Pass (Solve Adjoint ODE)
@@ -84,17 +78,11 @@ class AdjointMatchingSolver:
             with torch.enable_grad():
                 x_curr.requires_grad_(True)
                 v_curr = self.solver.get_velocity(self.model_fine, x_curr, t_now)
-                
-                # VJP: lambda^T * dv/dx
+                # VJP Calculation
                 vjp = torch.autograd.grad(v_curr, x_curr, grad_outputs=lambda_t, retain_graph=False)[0]
                 
-            # Clamp the VJP to prevent explosion
             vjp = torch.clamp(vjp, min=-5.0, max=5.0)
-
-            # Update lambda (Euler step backwards)
             lambda_t = lambda_t + vjp * dt
-            
-            # Clamp the Adjoint State
             lambda_t = torch.clamp(lambda_t, min=-5.0, max=5.0)
 
         # 4. Compute Loss
@@ -114,20 +102,18 @@ class AdjointMatchingSolver:
             diff = (v_fine - v_pre)
             loss_per_sample = torch.sum((diff + target_adjoint) ** 2, dim=1)
             
-            # Robust Clipping / Masking
-            loss_root = torch.sqrt(loss_per_sample.detach())
+            loss_root = torch.sqrt(loss_per_sample) # Keep grad here? No, loss_per_sample has grad
             
             if torch.isnan(loss_root).any():
                 continue
-                
-            current_quantile = torch.quantile(loss_root, self.config.per_sample_threshold_quantile)
+            
+            # Detach for quantile calculation
+            current_quantile = torch.quantile(loss_root.detach(), self.config.per_sample_threshold_quantile)
             ema_threshold = self._ema_update(current_quantile)
             
-            # [FIX] If threshold is 0 (first step edge case), don't mask everything
-            if ema_threshold < 1e-6:
-                mask = torch.ones_like(loss_root)
-            else:
-                mask = (loss_root < ema_threshold).float()
+            # [FIXED] Use <= and add epsilon to ensure we don't drop identical samples
+            # This prevents the "All Zero" mask when loss is constant
+            mask = (loss_root <= (ema_threshold + 1e-6)).float()
             
             total_loss += torch.mean(loss_per_sample * mask)
             valid_samples += 1
