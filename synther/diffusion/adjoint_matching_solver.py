@@ -1,267 +1,116 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Tuple, List, Optional
 
-class DDIMScheduler:
+class FlowMatchingSolver:
     """
-    Minimal implementation of SOCDDIMScheduler logic for general vector data.
-    Manages alphas, betas, and the update step (Eq 12 in DDIM paper).
+    Implements a simple Euler ODE solver for Flow Matching physics (t=0 -> t=1).
+    Replaces DDIMScheduler to ensure compatibility with S-MEME math.
     """
-    def __init__(self, num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, device='cpu'):
-        self.num_train_timesteps = num_train_timesteps
-        self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, device=device)
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.final_alpha_cumprod = torch.tensor(1.0, device=device) # For t < 0
+    def __init__(self, num_inference_steps=20):
+        self.num_inference_steps = num_inference_steps
+        # Simple linear time steps [0, ..., 1]
+        self.timesteps = torch.linspace(0, 1, num_inference_steps + 1)
 
-    def step(self, 
-             model_output: torch.Tensor, 
-             timestep: int, 
-             sample: torch.Tensor, 
-             eta: float = 0.0,
-             num_inference_steps: int = 40) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Performs one backward step (generation) from t to t-1.
-        Matches 'SOCDDIMScheduler.step'.
-        
-        Returns:
-            prev_sample (x_{t-1})
-            pred_original_sample (x_0 prediction)
-            std_dev_t (sigma_t for this step)
-        """
-        # 1. Calculate step indices
-        step_ratio = self.num_train_timesteps // num_inference_steps
-        prev_timestep = timestep - step_ratio
+    def get_velocity(self, model_wrapper, x, t):
+        """Queries the model to get the Vector Field v(x, t)."""
+        return model_wrapper(x, t)
 
-        # 2. Get alpha_bar terms
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        
-        if prev_timestep >= 0:
-            alpha_prod_t_prev = self.alphas_cumprod[prev_timestep]
-        else:
-            alpha_prod_t_prev = self.final_alpha_cumprod
-
-        beta_prod_t = 1 - alpha_prod_t
-        
-        # 3. Compute predicted x_0 (pred_original_sample)
-        pred_original_sample = (sample - (beta_prod_t ** 0.5) * model_output) / (alpha_prod_t ** 0.5)
-
-        # 4. Compute variance (sigma_t)
-        variance = (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
-        std_dev_t = eta * (variance ** 0.5)
-
-        # 5. Compute direction pointing to x_t
-        pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2)**0.5 * model_output
-
-        # 6. Compute prev_sample (x_{t-1}) deterministic part
-        prev_sample = (alpha_prod_t_prev ** 0.5) * pred_original_sample + pred_sample_direction
-
-        # 7. Add noise (if eta > 0)
-        if eta > 0:
-            noise = torch.randn_like(sample)
-            prev_sample = prev_sample + std_dev_t * noise
-            
-        return prev_sample, pred_original_sample, std_dev_t
-
+    def step_euler(self, x, v, dt):
+        """Simple Euler integration step."""
+        return x + v * dt
 
 class AdjointMatchingSolver:
-    def __init__(self, 
-                 model_pre: nn.Module, 
-                 model_fine: nn.Module, 
-                 config):
-        """
-        Args:
-            model_pre: Frozen pre-trained noise predictor.
-            model_fine: Trainable noise predictor.
-            config: Configuration object with keys:
-                - num_inference_steps (K): e.g. 40
-                - num_train_timesteps: e.g. 1000
-                - num_timesteps_to_load: Batch size for loss computation
-                - per_sample_threshold_quantile: e.g. 0.9 (for EMA clipping)
-                - reward_multiplier: Scale for reward gradient
-        """
+    def __init__(self, model_pre, model_fine, config):
         self.model_pre = model_pre
         self.model_fine = model_fine
         self.config = config
+        self.solver = FlowMatchingSolver(num_inference_steps=config.num_inference_steps)
         
-        # Scheduler setup
-        self.scheduler = DDIMScheduler(
-            num_train_timesteps=config.num_train_timesteps,
-            device=next(model_fine.parameters()).device
-        )
-        
-        # EMA Tracking for Loss Clipping
-        self.ema_value = -1
-        self.ema_updates = 0
-        self.ema_decay = 0.9
+        # EMA for Quantile Clipping (stabilizes training)
+        self.ema_quantile = 0.0
+        self.ema_decay = 0.99
 
-    def _ema_update(self, value):
-        """Updates the Exponential Moving Average of the loss quantile."""
-        if self.ema_updates == 0:
-            self.ema_value = value
-        elif self.ema_updates < 1.0 / self.ema_decay:
-            # Warmup
-            self.ema_value = value / (self.ema_updates + 1) + \
-                             (1 - 1 / (self.ema_updates + 1)) * self.ema_value
-        else:
-            # Standard EMA
-            self.ema_value = self.ema_decay * self.ema_value + (1 - self.ema_decay) * value
-        
-        self.ema_updates += 1
-        return self.ema_value
+    def _ema_update(self, new_val):
+        self.ema_quantile = self.ema_decay * self.ema_quantile + (1 - self.ema_decay) * new_val
+        return self.ema_quantile
 
-    def _sample_time_indices(self, num_timesteps, num_to_load, device):
+    def solve_and_compute_grad(self, x_start, prompt_emb, target_grad_fn, active_indices):
         """
-        Stratified Sampling. Handles requests > population size.
+        Performs the Forward Pass (Generation) and Backward Pass (Adjoint Calculation).
+        
+        Args:
+            target_grad_fn: A function that returns the Gradient of the Reward at x_final.
+                            For S-MEME, this returns -Score(x).
         """
-        if num_to_load >= num_timesteps:
-            return torch.arange(num_timesteps, device=device, dtype=torch.long)
-
-        middle_timestep = round(num_timesteps * 0.6)
+        device = x_start.device
+        batch_size = x_start.shape[0]
+        dt = 1.0 / self.config.num_inference_steps
         
-        pop1 = np.arange(0, middle_timestep)
-        pop2 = np.arange(middle_timestep, num_timesteps)
+        # 1. Forward Pass (Generate Trajectory)
+        traj = [x_start.detach()]
+        x_t = x_start.detach()
+        times = self.solver.timesteps.to(device)
         
-        goal_1 = num_to_load // 2
-        goal_2 = num_to_load - goal_1
-        
-        count_2 = min(len(pop2), goal_2)
-        remainder = goal_2 - count_2
-        count_1 = min(len(pop1), goal_1 + remainder)
-        
-        indices_1 = np.random.choice(pop1, count_1, replace=False)
-        indices_2 = np.random.choice(pop2, count_2, replace=False)
-        
-        indices = np.concatenate((indices_1, indices_2))
-        return torch.tensor(np.sort(indices), dtype=torch.long, device=device)
-
-    def _grad_inner_product(self, x, t_idx, vector, prompt_emb=None):
-        """Computes VJP (Vector-Jacobian Product) for the Adjoint ODE."""
-        with torch.enable_grad():
-            x = x.detach().requires_grad_(True)
+        for i in range(self.config.num_inference_steps):
+            t_now = times[i]
+            with torch.no_grad():
+                v_fine = self.solver.get_velocity(self.model_fine, x_t, t_now)
+            x_next = self.solver.step_euler(x_t, v_fine, dt)
+            traj.append(x_next.detach())
+            x_t = x_next
             
-            # Predict noise using FROZEN model_pre
-            t_tensor = torch.tensor([t_idx], device=x.device).repeat(x.shape[0])
-            noise_pred = self.model_pre(x, t_tensor, prompt_emb) 
-            
-            # Compute "Next Sample"
-            prev_sample, _, _ = self.scheduler.step(
-                noise_pred, t_idx, x, eta=0.0, 
-                num_inference_steps=self.config.num_inference_steps
-            )
-            
-            drift = prev_sample - x
-            sum_inner_prod = torch.sum(drift * vector)
-            
-            grad = torch.autograd.grad(sum_inner_prod, x)[0]
-            
-        return grad.detach()
-
-    def solve(self, x_0, reward_fn, prompt_emb=None):
-        """
-        Main execution of Algorithm 2 (Linear Solver).
-        """
-        device = x_0.device
-        batch_size = x_0.shape[0]
+        x_final = traj[-1]
         
-        timesteps = torch.linspace(
-            self.config.num_train_timesteps - 1, 0, 
-            self.config.num_inference_steps, 
-            device=device, dtype=torch.long
-        )
+        # 2. Compute Adjoint Terminal Condition
+        # We need the gradient of the Reward. 
+        # For S-MEME, we want to MAXIMIZE Entropy => Move against Density.
+        # Target Gradient = -Score(x).
         
-        # --- 1. Forward Pass (Sampling) ---
-        traj = [x_0]
-        curr_x = x_0
+        # Calculate the gradient at x_final
+        reward_grad = target_grad_fn(x_final)
         
-        with torch.no_grad():
-            for i, t in enumerate(timesteps):
-                t_tensor = torch.tensor([t], device=device).repeat(batch_size)
-                noise_pred = self.model_fine(curr_x, t_tensor, prompt_emb)
-                prev_x, _, _ = self.scheduler.step(
-                    noise_pred, t.item(), curr_x, 
-                    eta=self.config.eta, # Usually 1.0 for training exploration
-                    num_inference_steps=self.config.num_inference_steps
-                )
-                traj.append(prev_x)
-                curr_x = prev_x
-                
-        # --- 2. Adjoint Initialization ---
-        # "Noiseless update" trick from Paper Appendix H.1.
+        # Adjoint State lambda = - Gradient * Multiplier
+        lambda_t = -1.0 * reward_grad * self.config.reward_multiplier
         
-        x_prev = traj[-2] 
-        t_last = timesteps[-1].item() # t=0
-        
-        with torch.no_grad():
-            # Use model_fine for this final clean prediction
-            t_tensor = torch.tensor([t_last], device=device).repeat(batch_size)
-            noise_pred = self.model_fine(x_prev, t_tensor, prompt_emb)
-            
-            # Deterministic step (eta=0)
-            x_final_clean, _, _ = self.scheduler.step(
-                noise_pred, t_last, x_prev, eta=0.0,
-                num_inference_steps=self.config.num_inference_steps
-            )
-        
-        # FIX: Detach to make x_final_clean a leaf node.
-        # We need the gradient of the Reward function at this point.
-        # We do NOT need to backprop through the denoising step itself.
-        x_final_clean = x_final_clean.detach().requires_grad_(True)
-        
-        r = reward_fn(x_final_clean).sum()
-        r.backward()
-        reward_grad = x_final_clean.grad.detach() # Now this will work
-            
-        # Initialize Adjoint State
-        adjoint_state = -self.config.reward_multiplier * reward_grad
-        
+        # 3. Backward Pass (Solve Adjoint ODE)
         adjoint_storage = {} 
         
-        # --- 3. Backward Pass (Lean Adjoint ODE) ---
-        for k in range(self.config.num_inference_steps - 1, -1, -1):
-            t_val = timesteps[k].item()
-            x_k = traj[k]
+        for i in reversed(range(self.config.num_inference_steps)):
+            t_now = times[i]
+            x_curr = traj[i]
+            adjoint_storage[i] = lambda_t.detach()
             
-            vjp = self._grad_inner_product(x_k, t_val, adjoint_state, prompt_emb)
-            adjoint_state = adjoint_state + vjp
-            adjoint_storage[k] = adjoint_state
-            
-        # --- 4. Loss Computation ---
-        active_indices = self._sample_time_indices(
-            self.config.num_inference_steps, 
-            self.config.num_timesteps_to_load, 
-            device
-        )
-        
+            with torch.enable_grad():
+                x_curr.requires_grad_(True)
+                v_curr = self.solver.get_velocity(self.model_fine, x_curr, t_now)
+                # Vector-Jacobian Product: lambda^T * dv/dx
+                vjp = torch.autograd.grad(v_curr, x_curr, grad_outputs=lambda_t, retain_graph=False)[0]
+                
+            # Update lambda (Euler step backwards)
+            lambda_t = lambda_t + vjp * dt
+
+        # 4. Compute Matching Loss
         total_loss = 0.0
-        
-        for k in active_indices:
-            k = k.item()
-            t_val = timesteps[k].item()
+        for k_idx in active_indices:
+            k = k_idx.item()
+            t_val = times[k]
             x_k = traj[k].detach()
             target_adjoint = adjoint_storage[k].detach()
             
-            t_tensor = torch.tensor([t_val], device=device).repeat(batch_size)
-            eps_fine = self.model_fine(x_k, t_tensor, prompt_emb)
+            v_fine = self.solver.get_velocity(self.model_fine, x_k, t_val)
             with torch.no_grad():
-                eps_pre = self.model_pre(x_k, t_tensor, prompt_emb)
+                v_pre = self.solver.get_velocity(self.model_pre, x_k, t_val)
                 
-            _, _, std_dev_t = self.scheduler.step(eps_fine, t_val, x_k, eta=self.config.eta, 
-                                                  num_inference_steps=self.config.num_inference_steps)
+            diff = (v_fine - v_pre)
+            loss_per_sample = torch.sum((diff + target_adjoint) ** 2, dim=1)
             
-            diff = (eps_fine - eps_pre)
-            target = target_adjoint * std_dev_t.view(-1, 1) # broadcasting
-            
-            loss_per_sample = torch.sum((diff + target) ** 2, dim=1)
-            
-            # --- 5. EMA Quantile Clipping ---
+            # Robust Clipping
             loss_root = torch.sqrt(loss_per_sample.detach())
             current_quantile = torch.quantile(loss_root, self.config.per_sample_threshold_quantile)
             ema_threshold = self._ema_update(current_quantile)
             mask = (loss_root < ema_threshold).float()
             
-            loss_final = (loss_per_sample * mask).mean()
-            total_loss += loss_final
+            total_loss += torch.mean(loss_per_sample * mask)
             
-        return total_loss
+        return total_loss / len(active_indices)
